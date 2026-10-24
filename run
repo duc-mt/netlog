@@ -1,0 +1,28 @@
+#!/bin/sh
+# ==============================================================================
+# Script Name:   run
+# Description:   Universal cross-platform launcher for netlog.
+# Author:        Mai Tan Duc <ducmai.network@gmail.com>
+# Created:       2026-10-23
+# Version:       1.0.0
+# License:       MIT
+# ==============================================================================
+# Usage:         ./run [options] [arguments]
+# ==============================================================================
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+case "$(uname -s 2>/dev/null)" in
+    CYGWIN*|MINGW*|MSYS*)
+        # Windows running under Git Bash / MSYS / Cygwin
+        if [ -f "$SCRIPT_DIR/scripts/run.bat" ] && ! command -v bash >/dev/null 2>&1; then
+            exec cmd.exe /c "$SCRIPT_DIR/scripts/run.bat" "$@"
+        else
+            exec /bin/sh "$SCRIPT_DIR/scripts/run.sh" "$@"
+        fi
+        ;;
+    *)
+        exec /bin/sh "$SCRIPT_DIR/scripts/run.sh" "$@"
+        ;;
+esac

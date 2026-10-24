@@ -1,0 +1,151 @@
+name: 🚀 CI/CD & Release
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+
+# Cancel in-progress runs on the same branch to save runner minutes
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: ⤵️ Lint & Format
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Check code formatting (gofmt)
+        run: |
+          unformatted=$(gofmt -l cmd internal)
+          if [ -n "$unformatted" ]; then
+            echo "The following files are not formatted with gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Go vet
+        run: go vet -mod=vendor ./...
+
+  test:
+    name: ⤵️ Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Run tests with race detector & coverage
+        run: |
+          go test -mod=vendor -race -v -coverprofile=coverage.out ./...
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: netlog-coverage
+          path: coverage.out
+
+  build:
+    name: ⤵️ Build Artifacts
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Build cross-platform binaries
+        run: make cross
+
+      - name: Generate Checksums
+        run: |
+          cd bin
+          sha256sum netlog-* > checksums.txt 2>/dev/null || shasum -a 256 netlog-* > checksums.txt
+          cat checksums.txt
+
+      - name: Upload pre-built binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: netlog-binaries
+          path: |
+            bin/netlog-*
+            bin/checksums.txt
+
+  release:
+    name: 🚀 GitHub Release
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Build cross-platform binaries
+        run: make cross
+
+      - name: Generate Checksums
+        run: |
+          cd bin
+          sha256sum netlog-* > checksums.txt 2>/dev/null || shasum -a 256 netlog-* > checksums.txt
+
+      - name: Determine Release Info
+        id: release_info
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            tag="${GITHUB_REF#refs/tags/}"
+            echo "tag_name=${tag}" >> $GITHUB_OUTPUT
+            echo "release_name=${tag}" >> $GITHUB_OUTPUT
+            echo "generate_notes=true" >> $GITHUB_OUTPUT
+            touch release_body.md
+          else
+            echo "tag_name=latest" >> $GITHUB_OUTPUT
+            echo "release_name=Latest Build" >> $GITHUB_OUTPUT
+            echo "generate_notes=false" >> $GITHUB_OUTPUT
+            git log -1 --format="### 🚀 Latest Automated Build (%cd)%n%n- **Commit**: [\`%h\`](https://github.com/${GITHUB_REPOSITORY}/commit/%H)%n- **Message**: %s%n%n[View commit history](https://github.com/${GITHUB_REPOSITORY}/commits/${GITHUB_REF_NAME})" --date=short > release_body.md
+          fi
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_info.outputs.tag_name }}
+          name: ${{ steps.release_info.outputs.release_name }}
+          body_path: release_body.md
+          files: |
+            bin/netlog-*
+            bin/checksums.txt
+          generate_release_notes: ${{ steps.release_info.outputs.generate_notes }}
+          make_latest: "true"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,39 @@
+# ==============================================================================
+# File Name:     .gitignore
+# Description:   Files that must never be committed: builds, secrets, runtime
+#                data and test artifacts.
+# ==============================================================================
+
+# Build output
+bin/
+/netlog
+/netlog-*
+*.exe
+
+# Credentials and secrets (examples/.env.example is the committed template)
+.env
+*.env
+
+# Local, environment-specific inputs
+/inventory.csv
+known_hosts
+
+# Runtime data written by "netlog collect|monitor" (logs, incidents, state, lock)
+/data/
+
+# Test, coverage and profiling artifacts
+coverage.out
+coverage.html
+*.out
+*.cover
+*.test
+*.prof
+*.pprof
+# (testdata/fuzz/ is deliberately NOT ignored: fuzz regression inputs are committed)
+
+# Editor and OS noise
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

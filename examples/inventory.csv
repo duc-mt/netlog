@@ -1,0 +1,28 @@
+hostname,address,port,vendor,credential_group,jump_host
+# One device per line. port, vendor, credential_group and jump_host are optional:
+#   - port defaults to 22
+#   - vendor defaults to "generic" (best-effort "show logging")
+#   - credential_group defaults to "default" (NETLOG_USERNAME / NETLOG_PASSWORD or
+#     NETLOG_KEY_FILE in .env); a group name selects NETLOG_<GROUP>_* instead
+#   - jump_host: leave blank for direct connections; set to a bastion name or
+#     host[:port] for devices reachable only through a management server.
+#     The --jump-host flag sets the global default; this column overrides it.
+#
+# Platforms netlog can read logs from (vendor column), with common aliases:
+#   vyos, cisco_ios (cisco, ios-xe), cisco_asa (asa, ftd), cisco_sb (sg350, cbs350),
+#   huawei_vrp (huawei, h3c, comware), juniper_junos (junos), fortigate (fortios),
+#   aruba (aos-cx), ruijie (rgos), mikrotik (routeros), arista (eos),
+#   paloalto (pan-os), generic
+# pfsense, checkpoint_gaia and sophos are recognised but not supported yet: such
+# devices are skipped with one warning per run.
+#
+# Cisco / Ruijie devices need "service timestamps log datetime" (ideally with
+# "localtime" so log lines and "show clock" use the same time zone).
+core-sw1,10.10.1.1,22,cisco_ios,site_hcm,
+dist-sw1,10.50.2.1,22,huawei_vrp,site_hcm,
+gw-bvu-01,10.20.1.1,22,vyos,site_dc,bastion-dc
+edge-rtr1,10.20.2.1,22,juniper_junos,site_dc,bastion-dc
+dc-fw1,10.20.3.1,22,fortigate,site_dc,bastion-dc
+ap-ctrl1,10.40.1.1,22,aruba,default,
+access-sw1,10.50.1.1,22,ruijie,site_hcm,mgmt-gw.site-hcm.example.com:22
+edge-rtr2,10.20.4.1,22,mikrotik,site_dc,bastion-dc
