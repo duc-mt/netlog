@@ -13,12 +13,12 @@
 // session to a VyOS (or any systemd-based) device, the device records several
 // PAM / systemd housekeeping lines in its own log buffer:
 //
-//   pam_env(sshd:session): deprecated reading of user environment enabled
-//   pam_unix(sshd:session): session opened for user nms-net(uid=1004) by (uid=0)
-//   systemd[1]: Started Session 899 of User nms-net.
-//   systemd-logind[986]: New session 899 of user nms-net.
-//   systemd[1]: session-899.scope: Deactivated successfully.
-//   opt-vyatta-config-tmp-new_config_283448.mount: Deactivated successfully.
+//	pam_env(sshd:session): deprecated reading of user environment enabled
+//	pam_unix(sshd:session): session opened for user nms-net(uid=1004) by (uid=0)
+//	systemd[1]: Started Session 899 of User nms-net.
+//	systemd-logind[986]: New session 899 of user nms-net.
+//	systemd[1]: session-899.scope: Deactivated successfully.
+//	opt-vyatta-config-tmp-new_config_283448.mount: Deactivated successfully.
 //
 // These are captured on the very next poll and inflate the "new log entries"
 // counter, obscuring real events and feeding the anomaly detector with noise.
