@@ -27,6 +27,8 @@ $EDITOR .env inventory.csv
 ./run timeline  --from "2026-10-20 10:10:00" --to "2026-10-20 10:25:00"
 ./run incidents --since 24h            # list triage reports
 ./run incidents --id a1b2c3d4          # view formatted triage report (or --format json)
+./run report                           # last 7 days: noisy devices, who changed what, watchlist, trends
+./run report    --since 24h --top 5 --format json
 ```
 
 ### Standard Make / Direct Binary
@@ -40,6 +42,41 @@ bin/netlog collect --dry-run            # test connectivity and clock skew first
 bin/netlog collect --data-dir data          # poll everything once (cron-friendly)
 bin/netlog monitor --interval 2m            # or loop forever (systemd-friendly)
 ```
+
+## Reports
+
+`netlog report` answers "is my network doing something unusual?" where `query` and
+`timeline` answer "what happened at 10:22 on SW-LAB?". It re-reads the stored JSONL
+logs and incident reports for a window and prints six sections (read-only; nothing is
+written, and there is no daemon, dashboard or alerting):
+
+| Section | What it shows |
+| --- | --- |
+| Noisy Devices | `FAULT` events per device, top N |
+| Change Accountability | `CONFIG_CHANGE` + `AFTER_HOURS_CHANGE` per user (`(unknown)` last), plus the after-hours list |
+| Security Watchlist | `LOGIN_FAILURE` / `BRUTE_FORCE_ATTEMPT` grouped by source IP, ranked by **distinct devices hit**, then events |
+| Event Volume | events per UTC day x category (`CONFIG AUTH FAULT SECURITY SYSTEM`), empty days included |
+| Week-over-Week | per-category count against the equal window before it, absolute and percent (`n/a` when the earlier window is empty) |
+| Incident Closure | how many triage runs could not reconnect to the device, and which devices are unreachable every time |
+
+```sh
+netlog report                              # --since 7d, with the week-over-week delta
+netlog report --since 24h --top 5          # delta off by default for any other window
+netlog report --since 24h --compare        # force it: 24h against the 24h before it
+netlog report --format json | jq .         # one object, a key per section
+```
+
+| Flag | Default | |
+| --- | --- | --- |
+| `--since` | `7d` | `30m`, `2h`, `24h`, `7d`, `today` |
+| `--top` | `10` | rows in the noisy-device and watchlist rankings |
+| `--compare` | on only for exactly 7 days | force the delta on or off (`--compare=false`) |
+| `--format` | `table` | `table` or `json` |
+| `--data-dir` | `data` | |
+| `--no-color` | | |
+
+Rankings are fully ordered (count descending, then name / address), so output is
+stable and diffable. `week_over_week` is `null` in JSON when it was not computed.
 
 ## Configuration
 
@@ -147,13 +184,14 @@ make vendor           # go mod tidy && go mod vendor (needs network, run once)
 Layout:
 
 ```
-cmd/netlog/            CLI: collect | monitor | query | timeline | incidents
+cmd/netlog/            CLI: collect | monitor | query | timeline | incidents | report
 internal/collector/    SSH polling, worker pool, clock-skew capture
 internal/parser/       per-platform log parsers
 internal/pipeline/     watermark, normalizer, classifier, anomaly detector
 internal/triage/       allowlist, cooldown, playbooks, engine
 internal/store/        JSONL writer, incident files, watermark state
 internal/query/        filtering, tables, timeline
+internal/report/       rankings, rollups and week-over-week deltas (netlog report)
 internal/inventory/    CSV device inventory
 internal/credentials/  .env / environment credential resolution
 internal/sshclient/    SSH dialer (legacy algorithms, bastions)

@@ -5,7 +5,7 @@
 // Version:       1.0.0
 // License:       MIT
 // ==============================================================================
-// Usage:         netlog collect|monitor|query|timeline|incidents [flags]
+// Usage:         netlog collect|monitor|query|timeline|incidents|report [flags]
 // Notes:         Go package implementation
 // ==============================================================================
 // netlog polls network devices over SSH, normalizes their log buffers into
@@ -20,6 +20,7 @@
 //	netlog query     search stored events
 //	netlog timeline  cross-device chronology with causal annotation
 //	netlog incidents list triage reports, or show one
+//	netlog report    rankings, rollups and week-over-week trends
 //
 // The collect/monitor pipeline, per device and in this order: fetch the log
 // buffer -> parse -> drop already-seen lines (watermark) -> correct for clock
@@ -50,6 +51,7 @@ import (
 	"netlog/internal/parser"
 	"netlog/internal/pipeline"
 	"netlog/internal/query"
+	"netlog/internal/report"
 	"netlog/internal/sshclient"
 	"netlog/internal/store"
 	"netlog/internal/triage"
@@ -87,6 +89,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return cmdTimeline(args[1:], stdout, stderr)
 	case "incidents":
 		return cmdIncidents(args[1:], stdout, stderr)
+	case "report":
+		return cmdReport(args[1:], stdout, stderr)
 	case "version", "-version", "--version":
 		fmt.Fprintln(stdout, "netlog", version)
 		return exitOK
@@ -110,6 +114,7 @@ Usage:
   netlog query     [flags]   search stored events
   netlog timeline  [flags]   cross-device chronological view
   netlog incidents [flags]   list auto-triage reports, or show one with --id
+  netlog report    [flags]   rankings and trends: noisy devices, changes, watchlist
   netlog version
 
 Run "netlog <command> -h" for a command's flags.
@@ -123,6 +128,8 @@ Examples:
   netlog timeline --from "2026-10-20 10:10:00" --to "2026-10-20 10:25:00"
   netlog incidents --since 24h
   netlog incidents --id a1b2c3d4
+  netlog report                                                   last 7 days, with week-over-week delta
+  netlog report --since 24h --top 5 --format json
 
 Timestamps that devices print without a time zone are read in this host's
 local zone (set TZ to change it); any zone difference is absorbed by the
@@ -899,6 +906,87 @@ func cmdIncidents(args []string, stdout, stderr io.Writer) int {
 	}
 	if err := query.WriteIncidentList(stdout, reports, query.Style{Color: colorEnabled(stdout, *noColor)}); err != nil {
 		fmt.Fprintf(stderr, "netlog incidents: %v\n", err)
+		return exitError
+	}
+	return exitOK
+}
+
+// ==============================================================================
+// report
+// ==============================================================================
+
+func cmdReport(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("netlog report", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	var (
+		since   = fs.String("since", "7d", "time window: 30m, 2h, 24h, 7d, or today")
+		top     = fs.Int("top", report.DefaultTop, "rows shown in the noisy-device and watchlist rankings")
+		compare = fs.Bool("compare", false, "force the week-over-week delta on or off (default: on only when --since is exactly 7d)")
+		format  = fs.String("format", "table", "output format: table | json")
+		dataDir = fs.String("data-dir", "data", "netlog data directory")
+		noColor = fs.Bool("no-color", false, "disable coloured output")
+	)
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return exitOK
+		}
+		return exitUsage
+	}
+	if *format != "table" && *format != "json" {
+		fmt.Fprintf(stderr, "netlog report: --format must be table or json\n")
+		return exitUsage
+	}
+	if *top < 1 {
+		fmt.Fprintf(stderr, "netlog report: --top must be at least 1\n")
+		return exitUsage
+	}
+	now := time.Now()
+	from, err := query.ParseSince(*since, now)
+	if err != nil {
+		fmt.Fprintf(stderr, "netlog report: %v\n", err)
+		return exitUsage
+	}
+
+	// The delta compares the window with the equal-length one before it. It
+	// defaults to on for exactly one week; an explicit --compare either way wins.
+	window := now.Sub(from)
+	doCompare := window == report.Week
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "compare" {
+			doCompare = *compare
+		}
+	})
+	if window <= 0 {
+		doCompare = false
+	}
+
+	// Load back to the start of the previous window when it is needed.
+	loadFrom := from
+	if doCompare {
+		loadFrom = from.Add(-window)
+	}
+	entries, err := query.Load(*dataDir, query.Filter{Since: loadFrom, Until: now})
+	if err != nil {
+		fmt.Fprintf(stderr, "netlog report: %v\n", err)
+		return exitError
+	}
+	incidents, err := store.ListIncidents(store.IncidentsDir(*dataDir), from)
+	if err != nil {
+		fmt.Fprintf(stderr, "netlog report: %v\n", err)
+		return exitError
+	}
+
+	rep := report.Compute(entries, incidents, report.Options{
+		Since: from, Until: now, Top: *top, Compare: doCompare,
+		Label: strings.ToLower(strings.TrimSpace(*since)),
+	})
+	if *format == "json" {
+		err = report.WriteJSON(stdout, rep)
+	} else {
+		err = report.WriteTable(stdout, rep, query.Style{Color: colorEnabled(stdout, *noColor)})
+	}
+	if err != nil {
+		fmt.Fprintf(stderr, "netlog report: %v\n", err)
 		return exitError
 	}
 	return exitOK

@@ -18,6 +18,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -28,6 +29,7 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"netlog/internal/collector"
+	"netlog/internal/report"
 	"netlog/internal/store"
 )
 
@@ -553,5 +555,252 @@ func TestCmdInit(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "inventory.csv already exists, skipping") {
 		t.Errorf("second run should skip inventory.csv, got: %s", stdout.String())
+	}
+}
+
+// reportSection returns the text of one "=== <title> ... ===" section of the
+// table output, up to the next heading.
+func reportSection(t *testing.T, out, title string) string {
+	t.Helper()
+	i := strings.Index(out, "=== "+title)
+	if i < 0 {
+		t.Fatalf("section %q missing:\n%s", title, out)
+	}
+	rest := out[i+4:]
+	if j := strings.Index(rest, "\n=== "); j >= 0 {
+		rest = rest[:j]
+	}
+	return rest
+}
+
+// seedReportHistory adds days of history the fake device cannot produce (its
+// buffer only holds the last few minutes): an earlier part of the current
+// 7-day window, a previous-week window, and one entry too old for either.
+// Timestamps are at noon UTC so no test run can straddle a day boundary.
+func seedReportHistory(t *testing.T, dataDir string) {
+	t.Helper()
+	midnight := time.Now().UTC().Truncate(24 * time.Hour)
+	noon := func(daysAgo int, minute int) time.Time {
+		return midnight.AddDate(0, 0, -daysAgo).Add(12*time.Hour + time.Duration(minute)*time.Minute)
+	}
+	var entries []collector.LogEntry
+	add := func(host, category, event, user, srcIP string, ts time.Time) {
+		entries = append(entries, collector.LogEntry{
+			ID: collector.EntryID(host, fmt.Sprint(event, user, srcIP, ts.UnixNano())), Timestamp: ts, DeviceTS: ts,
+			Hostname: host, Category: category, Severity: "WARNING", Event: event, User: user, SourceIP: srcIP,
+			Summary: event, Raw: event,
+		})
+	}
+	// current window
+	for m := 0; m < 3; m++ {
+		add("SW-CORE", "FAULT", "LINK_DOWN", "", "", noon(3, m))
+	}
+	add("SW-CORE", "CONFIG", "CONFIG_CHANGE", "bachngo", "", noon(3, 10))
+	add("SW-CORE", "CONFIG", "CONFIG_CHANGE", "bachngo", "", noon(3, 11))
+	add("SW-CORE", "SECURITY", "AFTER_HOURS_CHANGE", "night", "", noon(2, 0))
+	add("SW-A", "AUTH", "LOGIN_FAILURE", "", "203.0.113.9", noon(3, 20))
+	add("SW-B", "AUTH", "LOGIN_FAILURE", "", "203.0.113.9", noon(3, 21))
+	add("SW-B", "AUTH", "LOGIN_FAILURE", "", "203.0.113.9", noon(3, 22))
+	add("SW-A", "AUTH", "LOGIN_FAILURE", "", "198.51.100.7", noon(3, 23))
+	// previous week
+	add("SW-CORE", "FAULT", "LINK_DOWN", "", "", noon(9, 0))
+	add("SW-CORE", "CONFIG", "CONFIG_CHANGE", "bachngo", "", noon(9, 1))
+	add("SW-CORE", "CONFIG", "CONFIG_CHANGE", "bachngo", "", noon(9, 2))
+	add("SW-A", "AUTH", "LOGIN_FAILURE", "", "203.0.113.9", noon(9, 3))
+	// older than both windows: must appear nowhere
+	add("SW-OLD", "FAULT", "LINK_DOWN", "", "", noon(20, 0))
+
+	w, err := store.NewJSONLWriter(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Append(entries); err != nil {
+		t.Fatal(err)
+	}
+
+	// Incidents: two where triage could not connect (SW-GONE every time), one
+	// where a command failed on a reachable device.
+	now := time.Now()
+	for _, r := range []collector.IncidentReport{
+		{ID: "seed-gone-1", Timestamp: now.Add(-24 * time.Hour), Hostname: "SW-GONE", Playbook: "link_down",
+			Diagnostics: []collector.DiagCmd{{Command: "(connect)", Error: "dial tcp: i/o timeout"}}},
+		{ID: "seed-gone-2", Timestamp: now.Add(-48 * time.Hour), Hostname: "SW-GONE", Playbook: "link_down",
+			Diagnostics: []collector.DiagCmd{{Command: "(connect)", Error: "dial tcp: i/o timeout"}}},
+		{ID: "seed-partial", Timestamp: now.Add(-3 * time.Hour), Hostname: "SW-LAB", Playbook: "link_down",
+			Diagnostics: []collector.DiagCmd{{Command: "show version", Output: "ok"}, {Command: "show ip route", Error: "timeout"}}},
+	} {
+		if _, err := store.WriteIncident(store.IncidentsDir(dataDir), r); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestReportEndToEnd(t *testing.T) {
+	_, host, port := startFakeIOS(t)
+	e := newEnv(t, fmt.Sprintf("SW-LAB,%s,%d,cisco_ios,default,\n", host, port))
+	dataDir := filepath.Join(e.dir, "data")
+
+	// ---- nothing collected yet: exit 0 and "no data" lines, never an error ----
+	out, stderr, code := e.run(t, "report", "--data-dir", dataDir, "--no-color")
+	if code != 0 || stderr != "" || strings.Count(out, "No matching events.") != 5 || !strings.Contains(out, "No incidents.") {
+		t.Fatalf("empty data dir: code=%d stderr=%q\n%s", code, stderr, out)
+	}
+	out, _, code = e.run(t, "report", "--data-dir", dataDir, "--format", "json")
+	var empty map[string]json.RawMessage
+	if code != 0 || json.Unmarshal([]byte(out), &empty) != nil || len(empty) != 6 || string(empty["noisy_devices"]) != "[]" {
+		t.Fatalf("empty data dir, json: code=%d\n%s", code, out)
+	}
+
+	// ---- real collection (SW-LAB: 2 faults, 2 config changes, 2 incidents), plus older days ----
+	if stderr, code := e.collect(t); code != 0 {
+		t.Fatalf("collect: exit %d\n%s", code, stderr)
+	}
+	seedReportHistory(t, dataDir)
+
+	// ---- table ----
+	out, stderr, code = e.run(t, "report", "--data-dir", dataDir, "--no-color")
+	if code != 0 || stderr != "" {
+		t.Fatalf("report: code=%d stderr=%q\n%s", code, stderr, out)
+	}
+	for _, bad := range []string{"\x1b", "\x07", "\r", "SW-OLD"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("output contains %q:\n%q", bad, out)
+		}
+	}
+	last := -1
+	for _, h := range []string{"Noisy Devices (top 10, last 7d)", "Change Accountability", "Security Watchlist (top 10, last 7d)",
+		"Event Volume by Category/Day", "Week-over-Week (last 7d vs previous 7d)", "Incident Closure"} {
+		i := strings.Index(out, "=== "+h)
+		if i < 0 || i < last {
+			t.Fatalf("heading %q missing or out of order:\n%s", h, out)
+		}
+		last = i
+	}
+
+	match := func(section, pattern string) {
+		t.Helper()
+		if !regexp.MustCompile(pattern).MatchString(section) {
+			t.Errorf("want /%s/ in:\n%s", pattern, section)
+		}
+	}
+	noisy := reportSection(t, out, "Noisy Devices")
+	match(noisy, `(?m)^SW-CORE\s+3$`)
+	match(noisy, `(?m)^SW-LAB\s+2$`)
+	if strings.Index(noisy, "SW-CORE") > strings.Index(noisy, "SW-LAB") {
+		t.Errorf("most faults first:\n%s", noisy)
+	}
+
+	changes := reportSection(t, out, "Change Accountability")
+	match(changes, `(?m)^bachngo\s+2\s+0$`)
+	match(changes, `(?m)^night\s+1\s+1$`)
+	match(changes, `(?m)^tanvt\s+1\s+0$`)
+	match(changes, `After-hours changes: 1`)
+	match(changes, `(?m)^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\s+SW-CORE\s+night$`)
+	if !strings.Contains(changes, "?[2Jevil") {
+		t.Errorf("the hostile user name should appear neutralised:\n%s", changes)
+	}
+
+	watch := reportSection(t, out, "Security Watchlist")
+	match(watch, `(?m)^203\.0\.113\.9\s+2\s+3\s+SW-A, SW-B$`)
+	match(watch, `(?m)^198\.51\.100\.7\s+1\s+1\s+SW-A$`)
+	if strings.Contains(watch, "6.6.6.6") || strings.Index(watch, "203.0.113.9") > strings.Index(watch, "198.51.100.7") {
+		t.Errorf("a source on more devices ranks first, and config-change IPs are not logins:\n%s", watch)
+	}
+
+	day3 := time.Now().UTC().Truncate(24*time.Hour).AddDate(0, 0, -3).Format("2006-01-02")
+	match(reportSection(t, out, "Event Volume"), `(?m)^`+day3+`\s+2\s+4\s+3\s+0\s+0$`)
+
+	delta := reportSection(t, out, "Week-over-Week")
+	match(delta, `(?m)^CONFIG\s+2\s+4\s+\+2\s+\+100\.0%$`)
+	match(delta, `(?m)^AUTH\s+1\s+4\s+\+3\s+\+300\.0%$`)
+	match(delta, `(?m)^FAULT\s+1\s+5\s+\+4\s+\+400\.0%$`)
+	match(delta, `(?m)^SECURITY\s+0\s+1\s+\+1\s+n/a$`)
+	match(delta, `(?m)^SYSTEM\s+0\s+0\s+0\s+n/a$`)
+	match(delta, `(?m)^TOTAL\s+4\s+14\s+\+10\s+\+250\.0%$`)
+
+	closure := reportSection(t, out, "Incident Closure")
+	match(closure, `Incidents:\s+5`)
+	match(closure, `All diagnostics succeeded:\s+2 \(40\.0%\)`)
+	match(closure, `Unreachable during triage:\s+2 \(40\.0%\)`)
+	match(closure, `Some commands failed:\s+1 \(20\.0%\)`)
+	match(closure, `(?m)^SW-GONE\s+2\s+2\s+yes$`)
+
+	// ---- json ----
+	out, stderr, code = e.run(t, "report", "--data-dir", dataDir, "--format", "json")
+	if code != 0 || stderr != "" || !json.Valid([]byte(out)) {
+		t.Fatalf("report --format json: code=%d stderr=%q\n%s", code, stderr, out)
+	}
+	if strings.Contains(out, "\x1b") {
+		t.Error("raw ESC in JSON output")
+	}
+	var rep report.Report
+	if err := json.Unmarshal([]byte(out), &rep); err != nil {
+		t.Fatal(err)
+	}
+	if got := rep.NoisyDevices; len(got) != 2 || got[0] != (report.DeviceFaultCount{Hostname: "SW-CORE", Count: 3}) || got[1] != (report.DeviceFaultCount{Hostname: "SW-LAB", Count: 2}) {
+		t.Errorf("noisy_devices = %+v", got)
+	}
+	if ca := rep.ChangeAccountability; ca.Total != 5 || ca.AfterHoursCount != 1 || ca.AfterHours[0].User != "night" || ca.AfterHours[0].Hostname != "SW-CORE" || ca.ByUser[0].User != "bachngo" {
+		t.Errorf("change_accountability = %+v", ca)
+	}
+	if w := rep.SecurityWatchlist; len(w) != 2 || w[0].SourceIP != "203.0.113.9" || w[0].DistinctHosts != 2 || w[0].Events != 3 {
+		t.Errorf("security_watchlist = %+v", w)
+	}
+	var faults int
+	for _, row := range rep.VolumeByCategory {
+		faults += row["FAULT"]
+	}
+	if faults != 5 {
+		t.Errorf("volume_by_category FAULT total = %d, want 5 (2 collected + 3 seeded; none from SW-OLD)", faults)
+	}
+	if w := rep.WeekOverWeek; w == nil || w.Categories[2].Category != "FAULT" || w.Categories[2].ChangePct == nil || *w.Categories[2].ChangePct != 400 ||
+		w.Categories[3].ChangePct != nil || w.Total.Current != 14 || w.Total.Previous != 4 {
+		t.Errorf("week_over_week = %+v", w)
+	}
+	if ic := rep.IncidentClosure; ic.Total != 5 || ic.Succeeded != 2 || ic.Unreachable != 2 || ic.PartialFailure != 1 ||
+		len(ic.UnreachableHosts) != 1 || ic.UnreachableHosts[0] != (report.UnreachableHost{Hostname: "SW-GONE", Unreachable: 2, Incidents: 2, Always: true}) {
+		t.Errorf("incident_closure = %+v", ic)
+	}
+
+	// ---- flags: --top, --since, --compare ----
+	out, _, code = e.run(t, "report", "--data-dir", dataDir, "--format", "json", "--top", "1")
+	var top1 report.Report
+	if code != 0 || json.Unmarshal([]byte(out), &top1) != nil || len(top1.NoisyDevices) != 1 || len(top1.SecurityWatchlist) != 1 ||
+		len(top1.ChangeAccountability.ByUser) != 4 {
+		t.Errorf("--top 1 caps the two rankings only: code=%d\n%s", code, out)
+	}
+
+	// 24h: only the collected events; no delta unless asked for.
+	out, _, code = e.run(t, "report", "--data-dir", dataDir, "--format", "json", "--since", "24h")
+	var day report.Report
+	if code != 0 || json.Unmarshal([]byte(out), &day) != nil || day.WeekOverWeek != nil ||
+		len(day.NoisyDevices) != 1 || day.NoisyDevices[0].Hostname != "SW-LAB" || len(day.SecurityWatchlist) != 0 {
+		t.Errorf("--since 24h: code=%d\n%s", code, out)
+	}
+	if !strings.Contains(out, `"week_over_week": null`) {
+		t.Errorf("week_over_week must be an explicit null when not computed:\n%s", out)
+	}
+	out, _, code = e.run(t, "report", "--data-dir", dataDir, "--since", "24h", "--compare", "--no-color")
+	if code != 0 || !strings.Contains(out, "=== Window-over-Window (last 24h vs the equal window before it) ===") {
+		t.Errorf("--since 24h --compare:\n%s", out)
+	}
+	out, _, code = e.run(t, "report", "--data-dir", dataDir, "--compare=false", "--no-color")
+	if code != 0 || strings.Contains(out, "Week-over-Week") || !strings.Contains(out, "=== Incident Closure") {
+		t.Errorf("--compare=false must drop the delta section:\n%s", out)
+	}
+
+	// ---- usage errors exit 2 without touching stdout ----
+	for _, args := range [][]string{{"--format", "xml"}, {"--top", "0"}, {"--since", "bogus"}, {"--nope"}} {
+		out, stderr, code := e.run(t, append([]string{"report", "--data-dir", dataDir}, args...)...)
+		if code != exitUsage || out != "" || stderr == "" {
+			t.Errorf("report %v: code=%d stdout=%q stderr=%q, want exit %d, an error on stderr and nothing on stdout", args, code, out, stderr, exitUsage)
+		}
+	}
+
+	// report only reads: running it changed nothing under the data directory.
+	before := len(e.logEntries(t))
+	e.run(t, "report", "--data-dir", dataDir)
+	if after := len(e.logEntries(t)); after != before {
+		t.Errorf("report modified the logs: %d -> %d entries", before, after)
 	}
 }
