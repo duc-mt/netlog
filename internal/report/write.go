@@ -86,6 +86,15 @@ func (r Report) normalized() Report {
 	if r.IncidentClosure.UnreachableHosts == nil {
 		r.IncidentClosure.UnreachableHosts = []UnreachableHost{}
 	}
+	if r.Outages.Longest == nil {
+		r.Outages.Longest = []Outage{}
+	}
+	if r.DeviceHealth.Unhealthy == nil {
+		r.DeviceHealth.Unhealthy = []DeviceStatus{}
+	}
+	if r.ClassificationCoverage == nil {
+		r.ClassificationCoverage = []VendorCoverage{}
+	}
 	if w := r.WeekOverWeek; w != nil && w.Categories == nil {
 		cp := *w
 		cp.Categories = []CategoryDelta{}
@@ -106,7 +115,7 @@ func WriteTable(w io.Writer, r Report, st query.Style) error {
 	if r.WeekOverWeek != nil {
 		writers = append(writers, writeDelta)
 	}
-	writers = append(writers, writeClosure)
+	writers = append(writers, writeClosure, writeOutages, writeDeviceHealth, writeCoverage)
 
 	for i, write := range writers {
 		if i > 0 {
@@ -165,7 +174,8 @@ func grid(p *printer, st query.Style, cols []column, rows [][]string, paint func
 				parts[c] = query.Pad(text, widths[c])
 			}
 		}
-		return strings.Join(parts, "  ")
+		// An empty last cell must not leave padding behind.
+		return strings.TrimRight(strings.Join(parts, "  "), " ")
 	}
 
 	titles := make([]string, len(cols))
@@ -283,9 +293,9 @@ func writeWatchlist(p *printer, r Report, st query.Style) {
 	}
 	rows := make([][]string, len(r.SecurityWatchlist))
 	for i, s := range r.SecurityWatchlist {
-		rows[i] = []string{s.SourceIP, itoa(s.DistinctHosts), itoa(s.Events), strings.Join(s.Hostnames, ", ")}
+		rows[i] = []string{s.SourceIP, itoa(s.DistinctHosts), itoa(s.Events), itoa(s.Detections), strings.Join(s.Hostnames, ", ")}
 	}
-	cols := []column{{"SOURCE IP", maxIPCol, false}, {"DEVICES", maxNumCol, true}, {"EVENTS", maxNumCol, true}, {"HOSTS", maxHostsCol, false}}
+	cols := []column{{"SOURCE IP", maxIPCol, false}, {"DEVICES", maxNumCol, true}, {"FAILURES", maxNumCol, true}, {"DETECTED", maxNumCol, true}, {"HOSTS", maxHostsCol, false}}
 	grid(p, st, cols, rows, func(i int, line string) string {
 		if r.SecurityWatchlist[i].DistinctHosts > 1 {
 			return st.Red(line) // one source touching several devices
@@ -372,7 +382,7 @@ func writeDelta(p *printer, r Report, st query.Style) {
 
 func writeClosure(p *printer, r Report, st query.Style) {
 	ic := r.IncidentClosure
-	heading(p, st, "Incident Closure (%s)", windowPhrase(r.Options))
+	heading(p, st, "Triage Reach (%s)", windowPhrase(r.Options))
 	if ic.Total == 0 {
 		p.println("No incidents.")
 		return
@@ -399,6 +409,91 @@ func writeClosure(p *printer, r Report, st query.Style) {
 	grid(p, st, cols, rows, func(i int, line string) string {
 		if ic.UnreachableHosts[i].Always {
 			return st.Red(line)
+		}
+		return line
+	})
+}
+
+// ---- 7. outages -------------------------------------------------------------
+
+// durationText renders a number of seconds as its two largest units: 35s,
+// 4m10s, 2h13m, 3d02h. A zero second unit is dropped (4m, 2h).
+func durationText(sec int64) string {
+	if sec < 0 {
+		sec = 0
+	}
+	d := time.Duration(sec) * time.Second
+	two := func(big int64, bigUnit string, small int64, smallUnit string) string {
+		if small == 0 {
+			return strconv.FormatInt(big, 10) + bigUnit
+		}
+		return strconv.FormatInt(big, 10) + bigUnit + strconv.FormatInt(small, 10) + smallUnit
+	}
+	switch {
+	case d < time.Minute:
+		return strconv.FormatInt(sec, 10) + "s"
+	case d < time.Hour:
+		return two(sec/60, "m", sec%60, "s")
+	case d < 24*time.Hour:
+		return two(sec/3600, "h", sec%3600/60, "m")
+	}
+	return two(sec/86400, "d", sec%86400/3600, "h")
+}
+
+func writeOutages(p *printer, r Report, st query.Style) {
+	o := r.Outages
+	heading(p, st, "Outages (top %d by duration, %s)", r.Options.top(), windowPhrase(r.Options))
+	if o.Total == 0 {
+		p.println("No outages.")
+	} else {
+		p.println(fmt.Sprintf("Outages: %d (%d resolved, %d still open)", o.Total, o.Resolved, o.Open))
+		if o.Resolved > 0 {
+			p.println("Mean time to recover: " + durationText(o.MeanSecondsToRecover) + " (resolved outages only)")
+		}
+		p.println("Longest: " + durationText(o.LongestSeconds))
+	}
+	if o.Untracked > 0 {
+		p.println(fmt.Sprintf("Untracked: %d outage start(s) whose log line names no interface or neighbor, so no recovery can be matched", o.Untracked))
+	}
+	if len(o.Longest) == 0 {
+		return
+	}
+
+	p.println("")
+	loc := st.Loc()
+	rows := make([][]string, len(o.Longest))
+	for i, x := range o.Longest {
+		dur := durationText(x.DurationSeconds)
+		if x.Open {
+			dur += "+ (open)"
+		}
+		rows[i] = []string{x.Hostname, x.Kind, x.Object, x.Down.In(loc).Format("2006-01-02 15:04:05"), dur}
+	}
+	cols := []column{{"DEVICE", query.MaxDeviceCol, false}, {"KIND", 4, false}, {"OBJECT", 30, false}, {"DOWN", len("2006-01-02 15:04:05"), false}, {"DURATION", 20, true}}
+	grid(p, st, cols, rows, func(i int, line string) string {
+		if o.Longest[i].Open {
+			return st.Red(line) // still down
+		}
+		return line
+	})
+}
+
+// ---- 9. classification coverage ---------------------------------------------
+
+func writeCoverage(p *printer, r Report, st query.Style) {
+	heading(p, st, "Classification Coverage (%s)", windowPhrase(r.Options))
+	if len(r.ClassificationCoverage) == 0 {
+		p.println(noData)
+		return
+	}
+	rows := make([][]string, len(r.ClassificationCoverage))
+	for i, c := range r.ClassificationCoverage {
+		rows[i] = []string{c.Vendor, itoa(c.Lines), itoa(c.Unclassified), strconv.FormatFloat(c.UnclassifiedPct, 'f', 1, 64) + "%"}
+	}
+	cols := []column{{"VENDOR", 20, false}, {"LINES", maxNumCol, true}, {"UNKNOWN", maxNumCol, true}, {"UNKNOWN %", maxNumCol, true}}
+	grid(p, st, cols, rows, func(i int, line string) string {
+		if c := r.ClassificationCoverage[i]; c.Lines >= 20 && c.UnclassifiedPct >= 90 {
+			return st.Yellow(line) // the classifier understands almost nothing of this vendor
 		}
 		return line
 	})

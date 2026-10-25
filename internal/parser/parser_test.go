@@ -194,6 +194,7 @@ func TestForDispatch(t *testing.T) {
 		"vyos": "*parser.vyosParser", "cisco_ios": "*parser.ciscoParser", "cisco_asa": "*parser.ciscoParser",
 		"huawei_vrp": "*parser.huaweiParser", "juniper_junos": "*parser.junosParser", "fortigate": "*parser.fortigateParser",
 		"mikrotik": "*parser.mikrotikParser", "arista": "*parser.genericParser", "ruijie": "*parser.genericParser", "generic": "*parser.genericParser",
+		"pfsense": "*parser.pfsenseParser", "checkpoint_gaia": "*parser.gaiaParser",
 	} {
 		if got := typeName(For(key, testOpt)); got != want {
 			t.Errorf("For(%q) = %s, want %s", key, got, want)
@@ -218,6 +219,10 @@ func typeName(p Parser) string {
 		return "*parser.fortigateParser"
 	case *mikrotikParser:
 		return "*parser.mikrotikParser"
+	case *pfsenseParser:
+		return "*parser.pfsenseParser"
+	case *gaiaParser:
+		return "*parser.gaiaParser"
 	case *genericParser:
 		return "*parser.genericParser"
 	}

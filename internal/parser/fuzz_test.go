@@ -15,7 +15,7 @@ import (
 	"netlog/internal/collector"
 )
 
-var fuzzKeys = []string{"vyos", "cisco_ios", "cisco_asa", "cisco_sb", "huawei_vrp", "juniper_junos", "fortigate", "mikrotik", "arista", "generic"}
+var fuzzKeys = []string{"vyos", "cisco_ios", "cisco_asa", "cisco_sb", "huawei_vrp", "juniper_junos", "fortigate", "mikrotik", "pfsense", "checkpoint_gaia", "arista", "generic"}
 
 var fuzzSeeds = []string{
 	"Oct 20 09:30:15.123: %SYS-5-CONFIG_I: Configured from console by bachngo on vty0 (10.10.10.50)",
@@ -27,6 +27,9 @@ var fuzzSeeds = []string{
 	`3: date=2026-10-20 time=09:30:15 tz="+0700" subtype="system" user="test" ui="ssh(10.1.1.9)" msg="x"`,
 	"oct/19 23:59:59 system,info,account user admin logged in from 10.1.1.1 via ssh",
 	"2026/10/20 09:30:15 high general general 0 Login failed for user admin",
+	"Oct 20 09:30:40 gw1 php-fpm[4567]: /index.php: Successful login for user 'admin' from: 10.0.0.5 (Local Database)",
+	"Oct 20 09:32:00 gw1 php-fpm[4567]: /interfaces.php: Configuration Change: admin@10.0.0.5 (Local Database): Interfaces: WAN configured",
+	"Oct 20 09:30:15 2026 gw1 clish[2345]: cmd by admin: Start executing : set hostname gw1 (cmd md5: abc123)",
 }
 
 // checkEntries asserts the invariants every parser promises.

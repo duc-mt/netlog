@@ -29,6 +29,7 @@ $EDITOR .env inventory.csv
 ./run incidents --id a1b2c3d4          # view formatted triage report (or --format json)
 ./run report                           # last 7 days: noisy devices, who changed what, watchlist, trends
 ./run report    --since 24h --top 5 --format json
+./run status                           # which devices could not be polled, and since when
 ```
 
 ### Standard Make / Direct Binary
@@ -46,18 +47,22 @@ bin/netlog monitor --interval 2m            # or loop forever (systemd-friendly)
 ## Reports
 
 `netlog report` answers "is my network doing something unusual?" where `query` and
-`timeline` answer "what happened at 10:22 on SW-LAB?". It re-reads the stored JSONL
-logs and incident reports for a window and prints six sections (read-only; nothing is
-written, and there is no daemon, dashboard or alerting):
+`timeline` answer "what happened at 10:22 on SW-LAB?". It reads the stored JSONL
+logs and incident reports for a window and prints nine sections (read-only; nothing
+is written, and there is no daemon, dashboard or alerting). Logs are streamed, so
+memory stays flat (about 16 MB for 600k entries) however long the window is.
 
 | Section | What it shows |
 | --- | --- |
 | Noisy Devices | `FAULT` events per device, top N |
 | Change Accountability | `CONFIG_CHANGE` + `AFTER_HOURS_CHANGE` per user (`(unknown)` last), plus the after-hours list |
-| Security Watchlist | `LOGIN_FAILURE` / `BRUTE_FORCE_ATTEMPT` grouped by source IP, ranked by **distinct devices hit**, then events |
+| Security Watchlist | `LOGIN_FAILURE` grouped by source IP, ranked by **distinct devices hit**, then failures. `DETECTED` counts the brute-force / password-spray detections netlog derived, kept apart so they do not inflate the failure count |
 | Event Volume | events per UTC day x category (`CONFIG AUTH FAULT SECURITY SYSTEM`), empty days included |
 | Week-over-Week | per-category count against the equal window before it, absolute and percent (`n/a` when the earlier window is empty) |
-| Incident Closure | how many triage runs could not reconnect to the device, and which devices are unreachable every time |
+| Triage Reach | how many triage runs could not reconnect to the device, and which devices are unreachable every time. (JSON key: `incident_closure`.) This measures reachability, not whether the problem went away: see Outages |
+| Outages | link, OSPF and BGP downs paired with their recovery: count, mean time to recover, the longest outages and any still open |
+| Device Health | devices netlog cannot poll or that never log (the table `netlog status` prints, minus the healthy ones) |
+| Classification Coverage | per vendor, the share of lines the classifier left `UNKNOWN`: where more rules are needed |
 
 ```sh
 netlog report                              # --since 7d, with the week-over-week delta
@@ -69,7 +74,7 @@ netlog report --format json | jq .         # one object, a key per section
 | Flag | Default | |
 | --- | --- | --- |
 | `--since` | `7d` | `30m`, `2h`, `24h`, `7d`, `today` |
-| `--top` | `10` | rows in the noisy-device and watchlist rankings |
+| `--top` | `10` | rows in the noisy-device, watchlist and outage rankings |
 | `--compare` | on only for exactly 7 days | force the delta on or off (`--compare=false`) |
 | `--format` | `table` | `table` or `json` |
 | `--data-dir` | `data` | |
@@ -77,6 +82,35 @@ netlog report --format json | jq .         # one object, a key per section
 
 Rankings are fully ordered (count descending, then name / address), so output is
 stable and diffable. `week_over_week` is `null` in JSON when it was not computed.
+
+Outage pairing needs the interface or neighbor a log line names, which netlog
+stores from this version on (`object` in the JSONL); older entries have none and
+are counted as "untracked" rather than guessed at.
+
+### Collection health
+
+netlog watches the network and also itself. Every poll updates
+`data/.netlog_health.json`, and `netlog status` prints it:
+
+```
+DEVICE   STATUS        LAST POLL OK      FAILS  LAST NEW LOGS     DETAIL
+dist-2   FAILING       2026-10-23 13:00     47  -                 [CONNECTION_TIMEOUT_OR_UNREACHABLE] ...
+quiet-3  SILENT        2026-10-24 18:59      -  2026-10-23 03:00  reachable, but no new log lines since ...
+new-4    NEVER POLLED  -                     -  -                 in the inventory but never polled
+core-1   OK            2026-10-24 18:59      -  2026-10-24 18:00
+```
+
+| Status | Meaning |
+| --- | --- |
+| `FAILING` | the last poll(s) failed; `FAILS` is the run length |
+| `STALE` | nothing has tried to poll it for `--stale-after` (default 24h): is the collector running? |
+| `UNPARSEABLE` | reachable, but not one line of the output could be parsed (check the log timestamp format) |
+| `SILENT` | reachable, but no new log line for `--silent-after` (default 24h). A very quiet device is not necessarily broken |
+| `UNSUPPORTED` | no fetch command for this platform; permanent, not an outage |
+| `NEVER POLLED` | in the inventory, never attempted |
+
+`netlog status --fail` exits 1 when any device is not `OK`, for cron and monitoring.
+It also reads `inventory.csv` (`--inventory`) to find the devices never polled.
 
 ## Configuration
 
@@ -107,9 +141,20 @@ Use a dedicated **read-only** account: netlog never needs more.
 | `fortigate` | `execute log filter category 1` + `execute log display` | interactive session |
 | `aruba`, `ruijie`, `arista`, `paloalto`, `generic` | `show logging` (PAN-OS: `show log system`) | best-effort parser |
 | `mikrotik` | `/log print` | best-effort parser |
+| `pfsense` | `tail -q -n 300 /var/log/system.log /var/log/auth.log` | pfSense 2.5 or newer (plain-text logs); the login needs shell access |
+| `checkpoint_gaia` | `tail -n 300 /var/log/messages` | the login's shell must be `/bin/bash` (not `clish`) |
 
-`pfsense`, `checkpoint_gaia` and `sophos` are recognised in the inventory but not
-supported yet; such devices are skipped with one warning per run.
+`sophos` is recognised in the inventory but not supported yet; such devices are
+skipped with one warning per run (and shown as `UNSUPPORTED` by `netlog status`).
+
+**pfSense and Check Point were written from the platforms' documented log
+formats and have not been checked against a live device.** If a version words a
+line differently the line is not misparsed, only left `UNKNOWN`. Run
+`netlog collect --dry-run`, then `netlog report` and look at the Classification
+Coverage section: a high `UNKNOWN %` for `pfsense` or `checkpoint_gaia` means a
+rule is missing, and a few sample lines are all that is needed to add it. Triage
+playbooks (the read-only diagnostics run after a fault) exist for the other
+platforms only; these two are collected and reported but not triaged.
 
 ## How it works
 
@@ -126,7 +171,14 @@ collect -> parse -> watermark dedup -> clock-skew correction -> classify
   log timestamps in the same time zone.
 - **Anomalies.** Link flaps, OSPF/BGP neighbour loss, brute-force logins, VRRP/STP
   changes and high CPU raise triage signals; config changes are remembered so a
-  fault shortly after one is annotated with its probable cause.
+  fault shortly after one is annotated with its probable cause. Failed logins
+  from one source address on **three or more devices within 10 minutes** raise a
+  `PASSWORD_SPRAY_ATTEMPT`: a spray that tries one or two passwords per device
+  never reaches the per-device brute-force threshold, and only the fleet-wide
+  view sees it. Recoveries (`LINK_UP`, `OSPF_ADJ_UP`, `BGP_PEER_UP`) are stored
+  so outages can be measured; HA changes, hardware faults (power, fan,
+  temperature) and err-disabled ports are classified and reported but raise no
+  triage.
 - **Auto-triage safety gates** (compiled in, not configurable):
   1. every command must match a read-only allowlist and contain no blocked word,
      shell metacharacter or unknown pipe filter;
@@ -142,6 +194,7 @@ data/
   logs/YYYY-MM-DD.jsonl        normalized log entries (UTC day)
   incidents/<ts>_<host>_<event>.json
   .netlog_state.json           watermarks
+  .netlog_health.json          per-device poll health (netlog status)
   .netlog_cooldown.json        triage cooldowns
   .netlog.lock                 one collector per data directory (Unix)
 ```

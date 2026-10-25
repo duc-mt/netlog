@@ -5,7 +5,7 @@
 // Version:       1.0.0
 // License:       MIT
 // ==============================================================================
-// Usage:         netlog collect|monitor|query|timeline|incidents|report [flags]
+// Usage:         netlog collect|monitor|query|timeline|incidents|report|status [flags]
 // Notes:         Go package implementation
 // ==============================================================================
 // netlog polls network devices over SSH, normalizes their log buffers into
@@ -21,6 +21,7 @@
 //	netlog timeline  cross-device chronology with causal annotation
 //	netlog incidents list triage reports, or show one
 //	netlog report    rankings, rollups and week-over-week trends
+//	netlog status    per-device collection health (failing, stale, silent)
 //
 // The collect/monitor pipeline, per device and in this order: fetch the log
 // buffer -> parse -> drop already-seen lines (watermark) -> correct for clock
@@ -91,6 +92,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return cmdIncidents(args[1:], stdout, stderr)
 	case "report":
 		return cmdReport(args[1:], stdout, stderr)
+	case "status":
+		return cmdStatus(args[1:], stdout, stderr)
 	case "version", "-version", "--version":
 		fmt.Fprintln(stdout, "netlog", version)
 		return exitOK
@@ -115,6 +118,7 @@ Usage:
   netlog timeline  [flags]   cross-device chronological view
   netlog incidents [flags]   list auto-triage reports, or show one with --id
   netlog report    [flags]   rankings and trends: noisy devices, changes, watchlist
+  netlog status    [flags]   per-device collection health: failing, stale, silent
   netlog version
 
 Run "netlog <command> -h" for a command's flags.
@@ -130,6 +134,8 @@ Examples:
   netlog incidents --id a1b2c3d4
   netlog report                                                   last 7 days, with week-over-week delta
   netlog report --since 24h --top 5 --format json
+  netlog status                                                   which devices could not be polled, and since when
+  netlog status --stale-after 1h --fail                           exit 1 if any device needs attention (for cron / monitoring)
 
 Timestamps that devices print without a time zone are read in this host's
 local zone (set TZ to change it); any zone difference is absorbed by the
@@ -352,6 +358,7 @@ type app struct {
 
 	collector  *collector.Collector
 	marks      *pipeline.Watermarks
+	health     *store.Health // per-device poll health, for "netlog status" and the report
 	classifier *pipeline.Classifier
 	detector   *pipeline.Detector
 	writer     *store.JSONLWriter
@@ -429,6 +436,12 @@ func newApp(o collectOpts, log *stderrLogger) (*app, error) {
 		release()
 		return nil, err
 	}
+	// Health is diagnostics only: a bad file is reported and replaced, and
+	// never stops collection.
+	health, err := store.LoadHealth(store.HealthPath(o.dataDir))
+	if err != nil {
+		log.Warn("%v", err)
+	}
 
 	interval := o.interval
 	if interval <= 0 {
@@ -475,6 +488,7 @@ func newApp(o collectOpts, log *stderrLogger) (*app, error) {
 		devices:   devices,
 		collector: coll,
 		marks:     pipeline.NewWatermarks(state),
+		health:    health,
 		classifier: pipeline.NewClassifierWithOptions(pipeline.ClassifierOptions{
 			Location:        time.Local,
 			AfterHoursStart: o.afterHoursStart,
@@ -571,6 +585,9 @@ func (a *app) cycle(ctx context.Context) cycleStats {
 	if err := a.marks.Save(); err != nil {
 		a.log.Warn("saving watermarks: %v", err)
 	}
+	if err := a.health.Save(); err != nil {
+		a.log.Warn("saving collection health: %v", err)
+	}
 	a.log.Info("cycle complete: %d/%d device(s) polled (%d failed), %d new log entr%s, %d triage signal(s), %s",
 		st.polled, len(a.devices), st.failed, st.entries, plural(st.entries, "y", "ies"), st.signals,
 		time.Since(began).Round(100*time.Millisecond))
@@ -583,6 +600,7 @@ func (a *app) safeProcess(ctx context.Context, r collector.Result, st *cycleStat
 	defer func() {
 		if p := recover(); p != nil {
 			st.failed++
+			a.health.Failed(r.Device.Hostname, time.Now(), fmt.Sprintf("internal error: %v", p), false)
 			a.log.Error("%s: internal error while processing the poll result: %v", r.Device.Hostname, p)
 		}
 	}()
@@ -603,6 +621,7 @@ func (a *app) process(ctx context.Context, r collector.Result, st *cycleStats) {
 
 	if r.Err != nil {
 		st.failed++
+		a.health.Failed(host, time.Now(), r.Err.Error(), errors.Is(r.Err, collector.ErrUnsupportedVendor))
 		// Log a failure when it first appears or changes, not every cycle.
 		if msg := r.Err.Error(); a.failing[host] != msg {
 			a.failing[host] = msg
@@ -615,6 +634,7 @@ func (a *app) process(ctx context.Context, r collector.Result, st *cycleStats) {
 		return
 	}
 	st.polled++
+	a.health.Succeeded(host, time.Now())
 	if _, was := a.failing[host]; was {
 		delete(a.failing, host)
 		a.log.Info("%s: poll recovered", host)
@@ -625,10 +645,12 @@ func (a *app) process(ctx context.Context, r collector.Result, st *cycleStats) {
 	parsed := parser.Parse(r.VendorKey, r.Raw, r.Device, parser.Options{Ref: r.FetchedAt, Location: a.loc})
 	if len(parsed) == 0 {
 		if n := nonEmptyLines(r.Raw); n >= 5 {
+			a.health.SetUnparseable(host, time.Now(), true)
 			a.warnEvery("noparse:"+host, 0, "%s: %d lines of log output but none could be parsed as %s; check the device's log timestamp format (Cisco/Ruijie need 'service timestamps log datetime')", host, n, r.VendorKey)
 		}
 		return
 	}
+	a.health.SetUnparseable(host, time.Now(), false)
 
 	// A line cannot be dated after "now" on the device. Such lines come from
 	// a clock that was stepped forward and back; keeping them would drag the
@@ -682,6 +704,7 @@ func (a *app) process(ctx context.Context, r collector.Result, st *cycleStats) {
 		return
 	}
 	st.entries += len(fresh)
+	a.health.NewLogs(host, time.Now())
 
 	// Stage 4: anomaly detection runs after the commit, so a retried batch
 	// cannot double-count toward a flap or brute-force threshold.
@@ -965,8 +988,21 @@ func cmdReport(args []string, stdout, stderr io.Writer) int {
 	if doCompare {
 		loadFrom = from.Add(-window)
 	}
-	entries, err := query.Load(*dataDir, query.Filter{Since: loadFrom, Until: now})
+	// Collection health is what netlog last saw of each device, not a
+	// property of the window. A bad health file is worth a warning only.
+	health, err := store.LoadHealth(store.HealthPath(*dataDir))
 	if err != nil {
+		fmt.Fprintf(stderr, "netlog report: warning: %v\n", err)
+	}
+
+	// Stream the logs into the report: memory stays proportional to the
+	// number of devices and sources, not to the volume of history.
+	b := report.NewBuilder(report.Options{
+		Since: from, Until: now, Top: *top, Compare: doCompare,
+		Label:   strings.ToLower(strings.TrimSpace(*since)),
+		Devices: report.DeviceStatuses(health.All(), nil, now, store.DefaultStaleAfter, store.DefaultSilentAfter),
+	})
+	if err := query.Scan(*dataDir, query.Filter{Since: loadFrom, Until: now}, b.AddEntry); err != nil {
 		fmt.Fprintf(stderr, "netlog report: %v\n", err)
 		return exitError
 	}
@@ -975,11 +1011,10 @@ func cmdReport(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "netlog report: %v\n", err)
 		return exitError
 	}
-
-	rep := report.Compute(entries, incidents, report.Options{
-		Since: from, Until: now, Top: *top, Compare: doCompare,
-		Label: strings.ToLower(strings.TrimSpace(*since)),
-	})
+	for _, inc := range incidents {
+		b.AddIncident(inc)
+	}
+	rep := b.Build()
 	if *format == "json" {
 		err = report.WriteJSON(stdout, rep)
 	} else {
@@ -988,6 +1023,77 @@ func cmdReport(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintf(stderr, "netlog report: %v\n", err)
 		return exitError
+	}
+	return exitOK
+}
+
+// ==============================================================================
+// status
+// ==============================================================================
+
+func cmdStatus(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("netlog status", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	var (
+		invPath     = fs.String("inventory", "inventory.csv", "path to the device inventory CSV (devices in it that were never polled are listed)")
+		dataDir     = fs.String("data-dir", "data", "netlog data directory")
+		staleAfter  = fs.Duration("stale-after", store.DefaultStaleAfter, "report a device as STALE when nothing has tried to poll it for this long")
+		silentAfter = fs.Duration("silent-after", store.DefaultSilentAfter, "report a device as SILENT when it is reachable but has produced no new log line for this long")
+		format      = fs.String("format", "table", "output format: table | json")
+		failOnBad   = fs.Bool("fail", false, "exit 1 when any device is not OK (for cron and monitoring)")
+		noColor     = fs.Bool("no-color", false, "disable coloured output")
+	)
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return exitOK
+		}
+		return exitUsage
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(stderr, "netlog status: unexpected argument %q\n", fs.Arg(0))
+		return exitUsage
+	}
+	if *format != "table" && *format != "json" {
+		fmt.Fprintf(stderr, "netlog status: --format must be table or json\n")
+		return exitUsage
+	}
+	if *staleAfter <= 0 || *silentAfter <= 0 {
+		fmt.Fprintf(stderr, "netlog status: --stale-after and --silent-after must be positive\n")
+		return exitUsage
+	}
+
+	health, err := store.LoadHealth(store.HealthPath(*dataDir))
+	if err != nil {
+		fmt.Fprintf(stderr, "netlog status: warning: %v\n", err)
+	}
+
+	// The inventory adds the devices that were never polled. Without it the
+	// command still reports everything netlog has recorded.
+	var hostnames []string
+	devices, warns := inventory.Load(*invPath)
+	if len(devices) == 0 && len(warns) > 0 {
+		fmt.Fprintf(stderr, "netlog status: inventory not read (%v); listing recorded devices only\n", warns[0])
+	}
+	for _, d := range devices {
+		hostnames = append(hostnames, d.Hostname)
+	}
+
+	rows := report.DeviceStatuses(health.All(), hostnames, time.Now(), *staleAfter, *silentAfter)
+	if *format == "json" {
+		err = report.WriteDeviceStatusJSON(stdout, rows)
+	} else {
+		err = report.WriteDeviceStatus(stdout, rows, query.Style{Color: colorEnabled(stdout, *noColor)})
+	}
+	if err != nil {
+		fmt.Fprintf(stderr, "netlog status: %v\n", err)
+		return exitError
+	}
+	if *failOnBad {
+		for _, r := range rows {
+			if r.Status != string(store.StatusOK) {
+				return exitError
+			}
+		}
 	}
 	return exitOK
 }

@@ -29,6 +29,9 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"netlog/internal/collector"
+	"netlog/internal/inventory"
+	"netlog/internal/parser"
+	"netlog/internal/pipeline"
 	"netlog/internal/report"
 	"netlog/internal/store"
 )
@@ -339,7 +342,7 @@ func TestCollectExitCodes(t *testing.T) {
 
 	// An unsupported vendor alongside a healthy device: partial failure is still success.
 	_, host, port := startFakeIOS(t)
-	e = newEnv(t, fmt.Sprintf("SW-LAB,%s,%d,cisco_ios,default,\nPF,%s,%d,pfsense,default,\n", host, port, host, port))
+	e = newEnv(t, fmt.Sprintf("SW-LAB,%s,%d,cisco_ios,default,\nPF,%s,%d,sophos,default,\n", host, port, host, port))
 	stderr, code = e.collect(t)
 	if code != 0 {
 		t.Errorf("partial failure must exit 0, got %d\n%s", code, stderr)
@@ -642,12 +645,12 @@ func TestReportEndToEnd(t *testing.T) {
 
 	// ---- nothing collected yet: exit 0 and "no data" lines, never an error ----
 	out, stderr, code := e.run(t, "report", "--data-dir", dataDir, "--no-color")
-	if code != 0 || stderr != "" || strings.Count(out, "No matching events.") != 5 || !strings.Contains(out, "No incidents.") {
+	if code != 0 || stderr != "" || strings.Count(out, "No matching events.") != 6 || !strings.Contains(out, "No incidents.") || !strings.Contains(out, "No outages.") {
 		t.Fatalf("empty data dir: code=%d stderr=%q\n%s", code, stderr, out)
 	}
 	out, _, code = e.run(t, "report", "--data-dir", dataDir, "--format", "json")
 	var empty map[string]json.RawMessage
-	if code != 0 || json.Unmarshal([]byte(out), &empty) != nil || len(empty) != 6 || string(empty["noisy_devices"]) != "[]" {
+	if code != 0 || json.Unmarshal([]byte(out), &empty) != nil || len(empty) != 9 || string(empty["noisy_devices"]) != "[]" {
 		t.Fatalf("empty data dir, json: code=%d\n%s", code, out)
 	}
 
@@ -669,7 +672,7 @@ func TestReportEndToEnd(t *testing.T) {
 	}
 	last := -1
 	for _, h := range []string{"Noisy Devices (top 10, last 7d)", "Change Accountability", "Security Watchlist (top 10, last 7d)",
-		"Event Volume by Category/Day", "Week-over-Week (last 7d vs previous 7d)", "Incident Closure"} {
+		"Event Volume by Category/Day", "Week-over-Week (last 7d vs previous 7d)", "Triage Reach", "Outages", "Device Health", "Classification Coverage"} {
 		i := strings.Index(out, "=== "+h)
 		if i < 0 || i < last {
 			t.Fatalf("heading %q missing or out of order:\n%s", h, out)
@@ -701,8 +704,8 @@ func TestReportEndToEnd(t *testing.T) {
 	}
 
 	watch := reportSection(t, out, "Security Watchlist")
-	match(watch, `(?m)^203\.0\.113\.9\s+2\s+3\s+SW-A, SW-B$`)
-	match(watch, `(?m)^198\.51\.100\.7\s+1\s+1\s+SW-A$`)
+	match(watch, `(?m)^203\.0\.113\.9\s+2\s+3\s+0\s+SW-A, SW-B$`)
+	match(watch, `(?m)^198\.51\.100\.7\s+1\s+1\s+0\s+SW-A$`)
 	if strings.Contains(watch, "6.6.6.6") || strings.Index(watch, "203.0.113.9") > strings.Index(watch, "198.51.100.7") {
 		t.Errorf("a source on more devices ranks first, and config-change IPs are not logins:\n%s", watch)
 	}
@@ -718,12 +721,20 @@ func TestReportEndToEnd(t *testing.T) {
 	match(delta, `(?m)^SYSTEM\s+0\s+0\s+0\s+n/a$`)
 	match(delta, `(?m)^TOTAL\s+4\s+14\s+\+10\s+\+250\.0%$`)
 
-	closure := reportSection(t, out, "Incident Closure")
+	closure := reportSection(t, out, "Triage Reach")
 	match(closure, `Incidents:\s+5`)
 	match(closure, `All diagnostics succeeded:\s+2 \(40\.0%\)`)
 	match(closure, `Unreachable during triage:\s+2 \(40\.0%\)`)
 	match(closure, `Some commands failed:\s+1 \(20\.0%\)`)
 	match(closure, `(?m)^SW-GONE\s+2\s+2\s+yes$`)
+
+	// The collection that just ran left a health record: SW-LAB is fine, so
+	// the section only says so.
+	match(reportSection(t, out, "Device Health"), `All 1 devices healthy\.`)
+	// Every collected line was classified except the banner-free few the fake
+	// device prints; coverage is reported per vendor.
+	match(reportSection(t, out, "Classification Coverage"), `(?m)^cisco_ios\s+\d+\s+\d+\s+\d+\.\d%$`)
+	match(reportSection(t, out, "Outages"), `No outages\.|Outages: \d+`)
 
 	// ---- json ----
 	out, stderr, code = e.run(t, "report", "--data-dir", dataDir, "--format", "json")
@@ -785,7 +796,7 @@ func TestReportEndToEnd(t *testing.T) {
 		t.Errorf("--since 24h --compare:\n%s", out)
 	}
 	out, _, code = e.run(t, "report", "--data-dir", dataDir, "--compare=false", "--no-color")
-	if code != 0 || strings.Contains(out, "Week-over-Week") || !strings.Contains(out, "=== Incident Closure") {
+	if code != 0 || strings.Contains(out, "Week-over-Week") || !strings.Contains(out, "=== Triage Reach") {
 		t.Errorf("--compare=false must drop the delta section:\n%s", out)
 	}
 
@@ -802,5 +813,255 @@ func TestReportEndToEnd(t *testing.T) {
 	e.run(t, "report", "--data-dir", dataDir)
 	if after := len(e.logEntries(t)); after != before {
 		t.Errorf("report modified the logs: %d -> %d entries", before, after)
+	}
+}
+
+// TestStatusEndToEnd drives collection health end to end: a healthy device, a
+// dead one, an unsupported platform and (before the first poll) devices that
+// are only in the inventory, through collection cycles, "netlog status" and
+// "netlog report".
+func TestStatusEndToEnd(t *testing.T) {
+	_, host, port := startFakeIOS(t)
+	e := newEnv(t, fmt.Sprintf("SW-LAB,%s,%d,cisco_ios,default,\n"+
+		"DEAD,127.0.0.1,1,cisco_ios,default,\n"+ // connection refused, instantly
+		"PF,%s,%d,sophos,default,\n", host, port, host, port))
+	dataDir := filepath.Join(e.dir, "data")
+	inv := filepath.Join(e.dir, "inventory.csv")
+	status := func(extra ...string) (string, string, int) {
+		return e.run(t, append([]string{"status", "--inventory", inv, "--data-dir", dataDir, "--no-color"}, extra...)...)
+	}
+	// startApp is a collector over the test inventory. A narrow interval
+	// shrinks the start stagger so a cycle takes milliseconds.
+	startApp := func() (*app, *bytes.Buffer) {
+		var stderr bytes.Buffer
+		a, err := newApp(collectOpts{
+			inventory: e.args[1], envFile: e.args[3], dataDir: e.args[5], concurrency: 4,
+			connectTimeout: 2 * time.Second, commandTimeout: 2 * time.Second, knownHosts: e.args[7], knownHostsPolicy: "accept-new",
+			legacyAlgorithms: true, jumpEnabled: false, interval: time.Second,
+		}, &stderrLogger{w: &stderr})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return a, &stderr
+	}
+	row := func(out, dev string) string {
+		t.Helper()
+		for _, l := range strings.Split(out, "\n") {
+			if strings.HasPrefix(l, dev+" ") {
+				return l
+			}
+		}
+		t.Fatalf("no row for %s in:\n%s", dev, out)
+		return ""
+	}
+
+	// Nothing polled yet: every inventory device is NEVER POLLED, and --fail says so.
+	out, stderr, code := status()
+	if code != 0 || stderr != "" || strings.Count(out, "NEVER POLLED") != 3 {
+		t.Fatalf("before any poll: code=%d stderr=%q\n%s", code, stderr, out)
+	}
+	if _, _, code := status("--fail"); code != exitError {
+		t.Errorf("--fail with unhealthy devices: exit %d, want %d", code, exitError)
+	}
+
+	// One cycle: SW-LAB is polled, DEAD refuses, PF has no fetch command.
+	a, _ := startApp()
+	a.cycle(t.Context())
+	out, _, code = status()
+	if code != 0 {
+		t.Fatalf("status: exit %d", code)
+	}
+	if r := row(out, "SW-LAB"); !strings.Contains(r, "OK") {
+		t.Errorf("SW-LAB should be OK: %q", r)
+	}
+	if r := row(out, "DEAD"); !regexp.MustCompile(`FAILING\s+-\s+1\s`).MatchString(r) {
+		t.Errorf("DEAD should be FAILING with 1 failed poll and no successful one: %q", r)
+	}
+	if r := row(out, "PF"); !strings.Contains(r, "UNSUPPORTED") || !strings.Contains(r, "no log fetch command") {
+		t.Errorf("PF should be UNSUPPORTED, not an outage: %q", r)
+	}
+	if strings.Index(out, "DEAD") > strings.Index(out, "SW-LAB") {
+		t.Errorf("the failing device must be listed first:\n%s", out)
+	}
+	if _, _, code := status("--fail"); code != exitError {
+		t.Errorf("--fail: exit %d, want %d", code, exitError)
+	}
+
+	// A second cycle extends the failure run; the healthy device stays healthy.
+	a.cycle(t.Context())
+	a.close()
+	out, _, _ = status()
+	if r := row(out, "DEAD"); !regexp.MustCompile(`FAILING\s+-\s+2\s`).MatchString(r) {
+		t.Errorf("two failed polls in a row: %q", r)
+	}
+	if r := row(out, "PF"); regexp.MustCompile(`UNSUPPORTED\s+-\s+\d`).MatchString(r) {
+		t.Errorf("an unsupported platform shows no failure count: %q", r)
+	}
+	if r := row(out, "SW-LAB"); !strings.Contains(r, "OK") {
+		t.Errorf("SW-LAB should still be OK: %q", r)
+	}
+
+	// JSON is a plain array with explicit nulls for what never happened.
+	out, _, code = status("--format", "json")
+	var rows []report.DeviceStatus
+	if code != 0 || json.Unmarshal([]byte(out), &rows) != nil || len(rows) != 3 {
+		t.Fatalf("status --format json: code=%d\n%s", code, out)
+	}
+	byHost := map[string]report.DeviceStatus{}
+	for _, r := range rows {
+		byHost[r.Hostname] = r
+	}
+	if d := byHost["DEAD"]; d.Status != "FAILING" || d.ConsecutiveFailures != 2 || d.LastSuccess != nil || d.FailingSince == nil || d.LastError == "" {
+		t.Errorf("DEAD = %+v", d)
+	}
+	if s := byHost["SW-LAB"]; s.Status != "OK" || s.LastSuccess == nil || s.LastNewLogs == nil {
+		t.Errorf("SW-LAB = %+v", s)
+	}
+
+	// The thresholds are knobs: with 1ns nothing has been polled "recently"
+	// and no log line is "new" any more.
+	out, _, _ = status("--stale-after", "1ns")
+	if r := row(out, "SW-LAB"); !strings.Contains(r, "STALE") || !strings.Contains(r, "is collect running?") {
+		t.Errorf("--stale-after 1ns: %q", r)
+	}
+	out, _, _ = status("--silent-after", "1ns")
+	if r := row(out, "SW-LAB"); !strings.Contains(r, "SILENT") || !strings.Contains(r, "no new log lines since") {
+		t.Errorf("--silent-after 1ns: %q", r)
+	}
+
+	// The report carries the same picture, and names only what needs attention.
+	out, _, code = e.run(t, "report", "--data-dir", dataDir, "--no-color")
+	if code != 0 {
+		t.Fatalf("report: exit %d", code)
+	}
+	health := reportSection(t, out, "Device Health")
+	if !strings.Contains(health, "2 of 3 devices need attention") || !strings.Contains(health, "DEAD") || !strings.Contains(health, "PF") {
+		t.Errorf("report device health:\n%s", health)
+	}
+	if regexp.MustCompile(`(?m)^SW-LAB\s`).MatchString(health) {
+		t.Errorf("a healthy device is not listed:\n%s", health)
+	}
+
+	// The health file is diagnostics: a corrupt one is reported but changes
+	// neither the exit code nor what the next collection does, and is replaced.
+	if err := os.WriteFile(store.HealthPath(dataDir), []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, stderr, code = status()
+	if code != 0 || !strings.Contains(stderr, "corrupt") || strings.Count(out, "NEVER POLLED") != 3 {
+		t.Errorf("corrupt health file: code=%d stderr=%q\n%s", code, stderr, out)
+	}
+	a, log := startApp()
+	a.cycle(t.Context())
+	a.close()
+	if !strings.Contains(log.String(), "corrupt") || !strings.Contains(log.String(), "cycle complete") {
+		t.Errorf("a corrupt health file must be reported and must not stop the cycle:\n%s", log.String())
+	}
+	if out, stderr, _ = status(); stderr != "" || !strings.Contains(row(out, "SW-LAB"), "OK") {
+		t.Errorf("the next collection should have replaced the bad file: %q\n%s", stderr, out)
+	}
+
+	// Usage errors.
+	for _, args := range [][]string{{"--format", "xml"}, {"--stale-after", "0s"}, {"--nope"}, {"extra"}} {
+		if out, stderr, code := status(args...); code != exitUsage || out != "" || stderr == "" {
+			t.Errorf("status %v: code=%d stdout=%q stderr=%q", args, code, out, stderr)
+		}
+	}
+}
+
+// TestOutagesEndToEnd follows raw device log lines all the way to the report:
+// parsed, classified (recovery events and the interface/neighbor they are
+// about), stored as JSONL, streamed back and paired into outages.
+func TestOutagesEndToEnd(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	stamp := func(ago time.Duration) string { return now.Add(-ago).Format("Jan _2 15:04:05.000") + ":" }
+
+	// Cisco logs the link and the line protocol for one physical event, a
+	// moment apart: each pair must count as one outage, not two.
+	iosLines := strings.Join([]string{
+		stamp(3*time.Hour) + " %LINK-3-UPDOWN: Interface GigabitEthernet0/1, changed state to down",
+		stamp(3*time.Hour-time.Second) + " %LINEPROTO-5-UPDOWN: Line protocol on Interface GigabitEthernet0/1, changed state to down",
+		stamp(3*time.Hour-20*time.Minute) + " %LINK-3-UPDOWN: Interface GigabitEthernet0/1, changed state to up",
+		stamp(3*time.Hour-20*time.Minute-time.Second) + " %LINEPROTO-5-UPDOWN: Line protocol on Interface GigabitEthernet0/1, changed state to up",
+		stamp(50*time.Minute) + " %BGP-5-ADJCHANGE: neighbor 10.0.0.1 Down BGP Notification sent",
+		stamp(20*time.Minute) + " %BGP-5-ADJCHANGE: neighbor 10.0.0.1 Up",
+	}, "\n")
+	// A neighbor that dropped and never came back. FULL appears in both the
+	// down and the (absent) up line: only the direction tells them apart.
+	ospfLines := stamp(90*time.Minute) + " %OSPF-5-ADJCHG: Process 1, Nbr 10.255.255.4 on GigabitEthernet0/2 from FULL to DOWN, Neighbor Down: Dead timer expired\n" +
+		stamp(80*time.Minute) + " %OSPF-5-ADJCHG: Process 1, Nbr 10.255.255.9 on GigabitEthernet0/3 from FULL to LOADING, Bad LS Req"
+
+	cls := pipeline.NewClassifier(time.UTC)
+	var entries []collector.LogEntry
+	for host, raw := range map[string]string{"R1": iosLines, "R2": ospfLines} {
+		dev := inventory.Device{Hostname: host, Address: "10.0.0.1", Vendor: "cisco_ios"}
+		got := parser.Parse("cisco_ios", raw, dev, parser.Options{Ref: now, Location: time.UTC})
+		for i := range got {
+			got[i].Timestamp = got[i].DeviceTS
+		}
+		cls.ClassifyAll(got)
+		entries = append(entries, got...)
+	}
+	if len(entries) != 8 {
+		t.Fatalf("parsed %d entries, want 8", len(entries))
+	}
+
+	dataDir := filepath.Join(t.TempDir(), "data")
+	w, err := store.NewJSONLWriter(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Append(entries); err != nil {
+		t.Fatal(err)
+	}
+
+	// The interface / neighbor is part of what is stored.
+	var stored strings.Builder
+	files, _ := filepath.Glob(filepath.Join(store.LogsDir(dataDir), "*.jsonl"))
+	for _, f := range files {
+		b, _ := os.ReadFile(f)
+		stored.Write(b)
+	}
+	for _, want := range []string{`"object":"GigabitEthernet0/1"`, `"object":"10.0.0.1"`, `"object":"10.255.255.4"`, `"event":"LINK_UP"`, `"event":"BGP_PEER_UP"`} {
+		if !strings.Contains(stored.String(), want) {
+			t.Errorf("stored logs lack %s", want)
+		}
+	}
+
+	out, stderr, code := (env{}).run(t, "report", "--data-dir", dataDir, "--since", "24h", "--format", "json")
+	if code != 0 || stderr != "" {
+		t.Fatalf("report: code=%d stderr=%q\n%s", code, stderr, out)
+	}
+	var rep report.Report
+	if err := json.Unmarshal([]byte(out), &rep); err != nil {
+		t.Fatal(err)
+	}
+	o := rep.Outages
+	if o.Total != 3 || o.Resolved != 2 || o.Open != 1 || o.Untracked != 0 || o.MeanSecondsToRecover != 1500 {
+		t.Fatalf("outages = %+v\n(the FULL→LOADING line is neither an outage nor a recovery; the doubled Cisco events are one each)", o)
+	}
+	// Longest first: the open OSPF neighbor (a lower bound), the BGP peer, the link.
+	ospf, bgp, link := o.Longest[0], o.Longest[1], o.Longest[2]
+	if !ospf.Open || ospf.Kind != "ospf" || ospf.Object != "10.255.255.4" || ospf.Hostname != "R2" || ospf.Up != nil || ospf.DurationSeconds < 5400 || ospf.DurationSeconds > 5400+120 {
+		t.Errorf("ospf = %+v", ospf)
+	}
+	if bgp.Open || bgp.Kind != "bgp" || bgp.Object != "10.0.0.1" || bgp.DurationSeconds != 1800 {
+		t.Errorf("bgp = %+v", bgp)
+	}
+	if link.Open || link.Kind != "link" || link.Object != "GigabitEthernet0/1" || link.DurationSeconds != 1200 {
+		t.Errorf("link = %+v", link)
+	}
+	// Recoveries are not faults: R1 has two link-down lines and one BGP down, R2 one OSPF down.
+	if got := rep.NoisyDevices; len(got) != 2 || got[0] != (report.DeviceFaultCount{Hostname: "R1", Count: 3}) || got[1] != (report.DeviceFaultCount{Hostname: "R2", Count: 1}) {
+		t.Errorf("noisy_devices = %+v (the up events must not count as faults)", got)
+	}
+
+	// And the table says it in words.
+	tbl, _, _ := (env{}).run(t, "report", "--data-dir", dataDir, "--since", "24h", "--no-color")
+	section := reportSection(t, tbl, "Outages")
+	for _, want := range []string{"Outages: 3 (2 resolved, 1 still open)", "Mean time to recover: 25m", "(open)"} {
+		if !strings.Contains(section, want) {
+			t.Errorf("outages section lacks %q:\n%s", want, section)
+		}
 	}
 }

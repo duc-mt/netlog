@@ -44,13 +44,33 @@ func fixture() Report {
 			loginFail("SW-CORE", "198.51.100.7", t0),
 		},
 		repeat(5, func(int) collector.LogEntry { return fault("SW-CORE", t0.Add(-9*day)) }), // previous week
+
+		// outages: a link back after 10m, an OSPF neighbor back after 1h, a BGP
+		// peer still down, and a down that names no object
+		[]collector.LogEntry{
+			down("SW-CORE", "LINK_DOWN", "Gi0/1", t0.Add(-6*time.Hour)), up("SW-CORE", "LINK_UP", "Gi0/1", t0.Add(-6*time.Hour+10*time.Minute)),
+			down("SW-LAB-LONG", "OSPF_ADJ_DOWN", "10.1.1.2", t0.Add(-3*time.Hour)), up("SW-LAB-LONG", "OSPF_ADJ_UP", "10.1.1.2", t0.Add(-2*time.Hour)),
+			down("SW-CORE", "BGP_PEER_DOWN", "10.0.0.1", t0.Add(-30*time.Minute)),
+			mk("SW-CORE", collector.CategoryFault, "LINK_DOWN", "", "", t0.Add(-20*time.Minute)),
+		},
+		// lines of a vendor the classifier barely understands
+		repeat(6, func(int) collector.LogEntry {
+			e := mk("PF-EDGE", collector.CategorySystem, "UNKNOWN", "", "", t0.Add(-time.Hour))
+			e.Vendor = "pfsense"
+			return e
+		}),
 	)
 	incidents := []collector.IncidentReport{
 		incident("SW-GONE", t0, diagNoConn),
 		incident("SW-GONE", t0.Add(-time.Hour), diagNoConn),
 		incident("SW-LAB-LONG", t0, diagOK),
 	}
-	return Compute(entries, incidents, Options{Since: t0.Add(-Week), Until: t0, Compare: true, Label: "7d"})
+	devices := []DeviceStatus{
+		{Hostname: "SW-CORE", Status: "OK"},
+		{Hostname: "SW-GONE", Status: "FAILING", ConsecutiveFailures: 47, LastError: "dial tcp 10.0.0.9:22: i/o timeout"},
+		{Hostname: "PF-EDGE", Status: "UNSUPPORTED", ConsecutiveFailures: 3, LastError: "PF-EDGE: no log fetch command for this platform"},
+	}
+	return Compute(entries, incidents, Options{Since: t0.Add(-Week), Until: t0, Compare: true, Label: "7d", Devices: devices})
 }
 
 func table(t *testing.T, r Report, st query.Style) string {
@@ -67,8 +87,8 @@ func table(t *testing.T, r Report, st query.Style) string {
 func TestWriteTableGolden(t *testing.T) {
 	want := `=== Noisy Devices (top 10, last 7d) ===
 DEVICE       FAULTS
-SW-LAB-LONG      12
-SW-CORE           3
+SW-LAB-LONG      13
+SW-CORE           6
 
 === Change Accountability (last 7d) ===
 USER       CHANGES  AFTER-HOURS
@@ -81,9 +101,9 @@ TIME                 DEVICE   USER
 2026-10-24 18:00:00  SW-CORE  bob
 
 === Security Watchlist (top 10, last 7d) ===
-SOURCE IP     DEVICES  EVENTS  HOSTS
-203.0.113.9         2       2  SW-CORE, SW-LAB-LONG
-198.51.100.7        1       1  SW-CORE
+SOURCE IP     DEVICES  FAILURES  DETECTED  HOSTS
+203.0.113.9         2         2         0  SW-CORE, SW-LAB-LONG
+198.51.100.7        1         1         0  SW-CORE
 
 === Event Volume by Category/Day (UTC, last 7d) ===
 DAY         CONFIG  AUTH  FAULT  SECURITY  SYSTEM
@@ -94,18 +114,18 @@ DAY         CONFIG  AUTH  FAULT  SECURITY  SYSTEM
 2026-10-21       0     0      0         0       0
 2026-10-22       0     0      0         0       0
 2026-10-23       0     0      3         0       0
-2026-10-24       3     3     12         1       0
+2026-10-24       3     3     16         1       8
 
 === Week-over-Week (last 7d vs previous 7d) ===
 CATEGORY  PREVIOUS  CURRENT  CHANGE  CHANGE %
 CONFIG           0        3      +3       n/a
 AUTH             0        3      +3       n/a
-FAULT            5       15     +10   +200.0%
+FAULT            5       19     +14   +280.0%
 SECURITY         0        1      +1       n/a
-SYSTEM           0        0       0       n/a
-TOTAL            5       22     +17   +340.0%
+SYSTEM           0        8      +8       n/a
+TOTAL            5       34     +29   +580.0%
 
-=== Incident Closure (last 7d) ===
+=== Triage Reach (last 7d) ===
 Incidents:                  3
 All diagnostics succeeded:  1 (33.3%)
 Unreachable during triage:  2 (66.7%)
@@ -114,6 +134,28 @@ Some commands failed:       0 (0.0%)
 Devices unreachable during triage:
 DEVICE   UNREACHABLE  INCIDENTS  ALWAYS
 SW-GONE            2          2     yes
+
+=== Outages (top 10 by duration, last 7d) ===
+Outages: 3 (2 resolved, 1 still open)
+Mean time to recover: 35m (resolved outages only)
+Longest: 1h
+Untracked: 1 outage start(s) whose log line names no interface or neighbor, so no recovery can be matched
+
+DEVICE       KIND  OBJECT    DOWN                    DURATION
+SW-LAB-LONG  ospf  10.1.1.2  2026-10-24 16:00:00           1h
+SW-CORE      bgp   10.0.0.1  2026-10-24 18:30:00  30m+ (open)
+SW-CORE      link  Gi0/1     2026-10-24 13:00:00          10m
+
+=== Device Health (collection status now) ===
+2 of 3 devices need attention:
+DEVICE   STATUS       LAST POLL OK  FAILS  LAST NEW LOGS  DETAIL
+SW-GONE  FAILING      -                47  -              dial tcp 10.0.0.9:22: i/o timeout
+PF-EDGE  UNSUPPORTED  -                 -  -              PF-EDGE: no log fetch command for this platform
+
+=== Classification Coverage (last 7d) ===
+VENDOR     LINES  UNKNOWN  UNKNOWN %
+pfsense        6        6     100.0%
+cisco_ios     28        0       0.0%
 `
 	got := table(t, fixture(), query.Style{Location: ict})
 	if got != want {
@@ -147,11 +189,13 @@ func TestWriteTableColourKeepsLayout(t *testing.T) {
 func TestWriteTableNoData(t *testing.T) {
 	opts := Options{Since: t0.Add(-Week), Until: t0, Label: "7d"}
 	got := table(t, Compute(nil, nil, opts), query.Style{})
-	if n := strings.Count(got, "No matching events."); n != 4 {
-		t.Errorf("want the no-data line in 4 sections, got %d:\n%s", n, got)
+	if n := strings.Count(got, "No matching events."); n != 5 {
+		t.Errorf("want the no-data line in 5 sections, got %d:\n%s", n, got)
 	}
-	if !strings.Contains(got, "No incidents.") {
-		t.Errorf("incident section should say so:\n%s", got)
+	for _, line := range []string{"No incidents.", "No outages.", "No collection health recorded yet (run netlog collect)."} {
+		if !strings.Contains(got, line) {
+			t.Errorf("want %q:\n%s", line, got)
+		}
 	}
 	if strings.Contains(got, "Week-over-Week") {
 		t.Errorf("the delta section appears only when computed:\n%s", got)
@@ -160,7 +204,7 @@ func TestWriteTableNoData(t *testing.T) {
 	// Compared, with nothing in either window: one line, not a table of n/a.
 	opts.Compare = true
 	got = table(t, Compute(nil, nil, opts), query.Style{})
-	if n := strings.Count(got, "No matching events."); n != 5 || strings.Contains(got, "n/a") {
+	if n := strings.Count(got, "No matching events."); n != 6 || strings.Contains(got, "n/a") {
 		t.Errorf("empty delta section:\n%s", got)
 	}
 
@@ -211,11 +255,20 @@ func TestWriteTableNeutralisesHostileText(t *testing.T) {
 		loginFail(evilHost, evilIP, t0),
 		loginFail("R2\x1b[H", evilIP, t0),
 	}
+	// outage object, vendor name and device status text also come from devices
+	evilObj := down(evilHost, "LINK_DOWN", "Gi0/1\x1b[2J\x07", t0.Add(-time.Hour))
+	evilVendor := mk(evilHost, collector.CategorySystem, "UNKNOWN", "", "", t0)
+	evilVendor.Vendor = "v\x1b[31m\x9b"
+	entries = append(entries, evilObj, evilVendor)
 	incidents := []collector.IncidentReport{
 		incident(evilHost, t0, collector.DiagCmd{Command: "(connect)", Error: "dial\x1b[2J"}),
 		incident("R2\x1b[H", t0, diagNoConn),
 	}
-	rep := Compute(entries, incidents, Options{Since: t0.Add(-Week), Until: t0, Compare: true, Label: "7d\x1b[2J"})
+	devices := []DeviceStatus{
+		{Hostname: evilHost, Status: "FAILING", ConsecutiveFailures: 2, LastError: "dial\x1b[2J\x07\r tcp"},
+		{Hostname: "ok\x1b[H", Status: "UNSUPPORTED", LastError: "no\x9bfetch"},
+	}
+	rep := Compute(entries, incidents, Options{Since: t0.Add(-Week), Until: t0, Compare: true, Label: "7d\x1b[2J", Devices: devices})
 
 	plain := table(t, rep, query.Style{Location: ict})
 	for _, bad := range []string{"\x1b", "\x07", "\r", "\x9b", "\u009b"} {
@@ -310,7 +363,7 @@ func TestWriteJSONShape(t *testing.T) {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	want := []string{"change_accountability", "incident_closure", "noisy_devices", "security_watchlist", "volume_by_category", "week_over_week"}
+	want := []string{"change_accountability", "classification_coverage", "device_health", "incident_closure", "noisy_devices", "outages", "security_watchlist", "volume_by_category", "week_over_week"}
 	if !reflect.DeepEqual(keys, want) {
 		t.Errorf("keys = %v, want exactly one per section %v", keys, want)
 	}
@@ -337,10 +390,13 @@ func TestWriteJSONRoundTrip(t *testing.T) {
 		!reflect.DeepEqual(back.SecurityWatchlist, rep.SecurityWatchlist) ||
 		!reflect.DeepEqual(back.VolumeByCategory, rep.VolumeByCategory) ||
 		!reflect.DeepEqual(back.IncidentClosure, rep.IncidentClosure) ||
+		!reflect.DeepEqual(back.ClassificationCoverage, rep.ClassificationCoverage) ||
+		back.Outages.Total != rep.Outages.Total || len(back.Outages.Longest) != len(rep.Outages.Longest) ||
+		!reflect.DeepEqual(back.DeviceHealth.Unhealthy, rep.DeviceHealth.Unhealthy) ||
 		!reflect.DeepEqual(back.ChangeAccountability.ByUser, rep.ChangeAccountability.ByUser) {
 		t.Errorf("sections changed in the round trip:\n%+v\n%+v", back, rep)
 	}
-	if back.WeekOverWeek == nil || back.WeekOverWeek.Total.ChangePct == nil || *back.WeekOverWeek.Total.ChangePct != 340 {
+	if back.WeekOverWeek == nil || back.WeekOverWeek.Total.ChangePct == nil || *back.WeekOverWeek.Total.ChangePct != 580 {
 		t.Errorf("week_over_week lost in the round trip: %+v", back.WeekOverWeek)
 	}
 	if f := back.WeekOverWeek.Categories[0]; f.Category != "CONFIG" || f.ChangePct != nil {
@@ -365,6 +421,21 @@ func TestWriteJSONNotComputedAndEmpty(t *testing.T) {
 	}
 	if string(top["volume_by_category"]) != "{}" {
 		t.Errorf("volume_by_category = %s, want {}", top["volume_by_category"])
+	}
+	if string(top["classification_coverage"]) != "[]" {
+		t.Errorf("classification_coverage = %s, want []", top["classification_coverage"])
+	}
+	var out struct {
+		Longest json.RawMessage `json:"longest"`
+	}
+	var dh struct {
+		Unhealthy json.RawMessage `json:"unhealthy"`
+	}
+	if err := json.Unmarshal(top["outages"], &out); err != nil || string(out.Longest) != "[]" {
+		t.Errorf("outages.longest = %s (%v), want []", out.Longest, err)
+	}
+	if err := json.Unmarshal(top["device_health"], &dh); err != nil || string(dh.Unhealthy) != "[]" {
+		t.Errorf("device_health.unhealthy = %s (%v), want []", dh.Unhealthy, err)
 	}
 
 	// A zero-value Report (not built by Compute) never prints a null section.

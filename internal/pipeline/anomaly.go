@@ -18,7 +18,11 @@
 //   - OSPF_ADJ_DOWN, BGP_PEER_DOWN: signal immediately.
 //   - VRRP_TRANSITION, STP_TCN, HIGH_CPU: signal (these have playbooks).
 //   - LOGIN_FAILURE: five or more from one source IP within 30 seconds emit
-//     a BRUTE_FORCE_ATTEMPT signal.
+//     a BRUTE_FORCE_ATTEMPT signal. Separately, failures from one source IP
+//     on three or more different devices within 10 minutes emit a
+//     PASSWORD_SPRAY_ATTEMPT signal: a spray that tries one or two passwords
+//     per device never reaches the per-device threshold, and only the
+//     fleet-wide view sees it.
 //   - CONFIG_CHANGE / AFTER_HOURS_CHANGE: no signal, but remembered so any
 //     FAULT within 10 minutes is annotated with the probable cause.
 //
@@ -93,6 +97,8 @@ type DetectorConfig struct {
 	FlapSuppress      time.Duration // individual-signal suppression after a flap (default 10m)
 	BruteThreshold    int           // failures that make a brute-force attempt (default 5)
 	BruteWindow       time.Duration // window for the failure count (default 30s)
+	SprayDevices      int           // distinct devices one source must fail on (default 3)
+	SprayWindow       time.Duration // window for that count (default 10m)
 	CorrelationWindow time.Duration // config-change-to-fault window (default 10m)
 	MaxSignalAge      time.Duration // oldest entry that may emit a signal (default 15m)
 	Now               func() time.Time
@@ -113,6 +119,12 @@ func (c *DetectorConfig) setDefaults() {
 	}
 	if c.BruteWindow <= 0 {
 		c.BruteWindow = 30 * time.Second
+	}
+	if c.SprayDevices <= 0 {
+		c.SprayDevices = 3
+	}
+	if c.SprayWindow <= 0 {
+		c.SprayWindow = 10 * time.Minute
 	}
 	if c.CorrelationWindow <= 0 {
 		c.CorrelationWindow = 10 * time.Minute
@@ -143,8 +155,26 @@ type deviceState struct {
 type Detector struct {
 	cfg     DetectorConfig
 	devices map[string]*deviceState
+	spray   map[string]*sprayTally // source IP -> recent failures across all devices
 	lastGC  time.Time
 	priming bool
+}
+
+// sprayHit is one failed login seen from a source address.
+type sprayHit struct {
+	host string
+	at   time.Time
+}
+
+// sprayTally is the recent failures from one source address, over every
+// device. newest is the latest failure time seen; hits older than
+// newest-SprayWindow are dropped. Devices are polled one after another, so
+// one device's batch can be fed before an older line of another device: a
+// hit up to SprayWindow older than newest is still accepted, anything older
+// is ignored (it cannot be part of a window that ends at newest).
+type sprayTally struct {
+	newest time.Time
+	hits   []sprayHit
 }
 
 // gcInterval is how often idle detector state is swept. Without it, a
@@ -156,7 +186,7 @@ const gcInterval = 10 * time.Minute
 // NewDetector returns a Detector.
 func NewDetector(cfg DetectorConfig) *Detector {
 	cfg.setDefaults()
-	return &Detector{cfg: cfg, devices: make(map[string]*deviceState)}
+	return &Detector{cfg: cfg, devices: make(map[string]*deviceState), spray: make(map[string]*sprayTally)}
 }
 
 func (d *Detector) state(host string) *deviceState {
@@ -232,6 +262,11 @@ func (d *Detector) maybeGC() {
 			delete(d.devices, host)
 		}
 	}
+	for ip, t := range d.spray {
+		if t.newest.Before(now.Add(-d.cfg.SprayWindow)) {
+			delete(d.spray, ip)
+		}
+	}
 }
 
 func (d *Detector) observe(e collector.LogEntry) []TriageSignal {
@@ -253,6 +288,13 @@ func (d *Detector) observe(e collector.LogEntry) []TriageSignal {
 		}
 		st.flapUntil[key] = ts.Add(d.cfg.FlapSuppress)
 		st.linkDowns[key] = nil
+		return nil
+
+	case EventPasswordSpray:
+		// A previously reported spray (replayed from storage): forget the
+		// failures that made it, so the same spray is not reported twice
+		// across runs.
+		delete(d.spray, e.SourceIP)
 		return nil
 
 	case EventLoginFailure:
@@ -366,6 +408,13 @@ func (d *Detector) observeLoginFailure(st *deviceState, e collector.LogEntry, fr
 	if e.SourceIP == "" {
 		return nil // cannot attribute the failure to a source
 	}
+	sigs := d.observeBurst(st, e, fresh)
+	return append(sigs, d.observeSpray(st, e, fresh)...)
+}
+
+// observeBurst is the per-device rule: BruteThreshold failures from one
+// source on this device within BruteWindow.
+func (d *Detector) observeBurst(st *deviceState, e collector.LogEntry, fresh bool) []TriageSignal {
 	ts := e.Timestamp
 	window := pruneBefore(st.loginFails[e.SourceIP], ts.Add(-d.cfg.BruteWindow))
 	window = append(window, ts)
@@ -388,6 +437,65 @@ func (d *Detector) observeLoginFailure(st *deviceState, e collector.LogEntry, fr
 	return []TriageSignal{d.signal(st, bf, PlaybookBruteForce, PriorityCritical, true)}
 }
 
+// maxSprayNames bounds how many device names a spray summary lists.
+const maxSprayNames = 5
+
+// observeSpray is the fleet-wide rule: one source failing logins on
+// SprayDevices distinct devices within SprayWindow. The tally is cleared when
+// the rule trips, so a continuing spray is reported again only after another
+// SprayDevices devices have been hit.
+func (d *Detector) observeSpray(st *deviceState, e collector.LogEntry, fresh bool) []TriageSignal {
+	t := d.spray[e.SourceIP]
+	if t == nil {
+		t = &sprayTally{}
+		d.spray[e.SourceIP] = t
+	}
+	if e.Timestamp.After(t.newest) {
+		t.newest = e.Timestamp
+	}
+	cutoff := t.newest.Add(-d.cfg.SprayWindow)
+	if e.Timestamp.Before(cutoff) {
+		return nil
+	}
+	kept := t.hits[:0]
+	for _, h := range t.hits {
+		if !h.at.Before(cutoff) {
+			kept = append(kept, h)
+		}
+	}
+	t.hits = append(kept, sprayHit{host: e.Hostname, at: e.Timestamp})
+
+	seen := make(map[string]struct{}, len(t.hits))
+	for _, h := range t.hits {
+		seen[h.host] = struct{}{}
+	}
+	if len(seen) < d.cfg.SprayDevices {
+		return nil
+	}
+	delete(d.spray, e.SourceIP)
+	if !fresh {
+		return nil
+	}
+
+	hosts := make([]string, 0, len(seen))
+	for h := range seen {
+		hosts = append(hosts, h)
+	}
+	sort.Strings(hosts)
+	names := strings.Join(hosts, ", ")
+	if len(hosts) > maxSprayNames {
+		names = strings.Join(hosts[:maxSprayNames], ", ") + fmt.Sprintf(" and %d more", len(hosts)-maxSprayNames)
+	}
+
+	sp := e
+	sp.ID = collector.EntryID(e.Hostname, "derived:"+EventPasswordSpray+":"+e.Raw)
+	sp.Category = collector.CategorySecurity
+	sp.Event = EventPasswordSpray
+	sp.Severity = collector.SeverityCritical
+	sp.Summary = fmt.Sprintf("failed logins from %s on %d devices (%s) within %s", e.SourceIP, len(hosts), names, d.cfg.SprayWindow)
+	return []TriageSignal{d.signal(st, sp, PlaybookBruteForce, PriorityHigh, true)}
+}
+
 // pruneBefore drops leading times earlier than cutoff (times arrive in order).
 func pruneBefore(times []time.Time, cutoff time.Time) []time.Time {
 	i := 0
@@ -403,13 +511,14 @@ func pruneBefore(times []time.Time, cutoff time.Time) []time.Time {
 
 // interfacePatterns are tried in order; the first capture wins.
 var interfacePatterns = []*regexp.Regexp{
-	regexp.MustCompile(`(?i)\bifName\s+([A-Za-z][\w/.:-]*\d)`),                                    // Junos SNMP link trap
-	regexp.MustCompile(`(?i)\binterface\s+([A-Za-z][\w/.:-]*\d)\b`),                               // Cisco, Huawei, Arista
-	regexp.MustCompile(`(?i)\binterface\s+(\d+(?:/\d+)+)\b`),                                      // Aruba CX "1/1/24"
-	regexp.MustCompile(`\bon\s+([A-Za-z][A-Za-z0-9/.:_-]*\d)\b`),                                  // OSPF "... on Gi0/1 ..."
-	regexp.MustCompile(`\b((?:eth|ens|enp|eno|bond|br|vti|tun|wg|veth|vxlan|dum|lo)\d[\w./:-]*)`), // Linux / VyOS
-	regexp.MustCompile(`\b(ether\d+|sfp[\w-]*\d+|bridge\d*|vlan\d+)\b`),                           // MikroTik
-	regexp.MustCompile(`\b([A-Za-z]{2,}-?\d+(?:/\d+)+(?:\.\d+)?)`),                                // Gi0/1, ge-0/0/1, 1/0/24
+	regexp.MustCompile(`(?i)\bifName\s+([A-Za-z][\w/.:-]*\d)`),                                                                  // Junos SNMP link trap
+	regexp.MustCompile(`(?i)\binterface\s+([A-Za-z][\w/.:-]*\d)\b`),                                                             // Cisco, Huawei, Arista
+	regexp.MustCompile(`(?i)\binterface\s+(\d+(?:/\d+)+)\b`),                                                                    // Aruba CX "1/1/24"
+	regexp.MustCompile(`\bon\s+([A-Za-z][A-Za-z0-9/.:_-]*\d)\b`),                                                                // OSPF "... on Gi0/1 ..."
+	regexp.MustCompile(`\b((?:eth|ens|enp|eno|bond|br|vti|tun|wg|veth|vxlan|dum|lo)\d[\w./:-]*)`),                               // Linux / VyOS
+	regexp.MustCompile(`\b(ether\d+|sfp[\w-]*\d+|bridge\d*|vlan\d+)\b`),                                                         // MikroTik
+	regexp.MustCompile(`\b([A-Za-z]{2,}-?\d+(?:/\d+)+(?:\.\d+)?)`),                                                              // Gi0/1, ge-0/0/1, 1/0/24
+	regexp.MustCompile(`\b((?:igb|ixl|ix|em|re|bge|bce|vtnet|vmx|mlxen|lagg|ovpnc|ovpns|enc|gif|gre|pppoe|ng)\d+(?:\.\d+)?)\b`), // FreeBSD / pfSense
 }
 
 var peerPattern = regexp.MustCompile(`(?i)\b(?:neighbor|nbr|peer)(?:\s+address)?[\s=:]+([0-9a-fA-F:.]+)\b`)

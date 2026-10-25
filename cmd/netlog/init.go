@@ -68,9 +68,10 @@ const sampleInventory = `hostname,address,port,vendor,credential_group,jump_host
 #   vyos, cisco_ios (cisco, ios-xe), cisco_asa (asa, ftd), cisco_sb (sg350, cbs350),
 #   huawei_vrp (huawei, h3c, comware), juniper_junos (junos), fortigate (fortios),
 #   aruba (aos-cx), ruijie (rgos), mikrotik (RouterOS), arista (eos),
-#   paloalto (pan-os), generic
-# pfsense, checkpoint_gaia and sophos are recognised but not supported yet: such
-# devices are skipped with one warning per run.
+#   paloalto (pan-os), pfsense (2.5+, needs shell access), checkpoint_gaia
+#   (the login's shell must be /bin/bash), generic
+# sophos is recognised but not supported yet: such devices are skipped with one
+# warning per run.
 #
 # Cisco / Ruijie devices need "service timestamps log datetime" (ideally with
 # "localtime" so log lines and "show clock" use the same time zone).

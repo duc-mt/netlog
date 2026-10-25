@@ -11,26 +11,33 @@
 // Package report answers "is my network doing something unusual?", where
 // "netlog query" and "netlog timeline" answer "what happened at 10:22:15 on
 // SW-LAB?". It aggregates the entries and incident reports that are already
-// on disk over a time window into six sections:
+// on disk over a time window into nine sections:
 //
-//  1. noisy devices        FAULT events per device
-//  2. change accountability CONFIG_CHANGE / AFTER_HOURS_CHANGE per user
-//  3. security watchlist   source IPs that hit more than one device
-//  4. event volume         a category x UTC-day count matrix
-//  5. week-over-week       per-category percent change against the prior window
-//  6. incident closure     how many triage runs could not reach the device
+//  1. noisy devices          FAULT events per device
+//  2. change accountability  CONFIG_CHANGE / AFTER_HOURS_CHANGE per user
+//  3. security watchlist     source IPs that hit more than one device
+//  4. event volume           a category x UTC-day count matrix
+//  5. week-over-week         per-category percent change against the prior window
+//  6. triage reach           how many triage runs could not reach the device
+//  7. outages                link / OSPF / BGP downs paired with their recovery
+//  8. device health          devices netlog cannot poll, or that never log
+//  9. classification coverage  the share of each vendor's lines left UNKNOWN
 //
-// Compute is a pure function of its arguments: it performs no file I/O, reads
-// no clock and mutates nothing, so it is tested on in-memory fixtures. The
-// caller loads the data with query.Load and store.ListIncidents, exactly as
-// "netlog query" and "netlog incidents" do. The security watchlist is the one
-// genuinely new computation. It groups by source IP across every device and
-// every day in the window, which no single device's view, and no single run
-// of the in-memory anomaly detector, can see.
+// A Builder accumulates a report one entry at a time, so memory is bounded by
+// the number of distinct devices, source addresses and users, not by how many
+// log lines the window holds. Compute is the same thing over slices. Neither
+// performs file I/O, reads a clock or mutates its input: the caller streams
+// the data in (query.Scan, store.ListIncidents) and hands over the device
+// health it read, which keeps the package testable on in-memory fixtures.
+//
+// The security watchlist is the one genuinely new computation. It groups by
+// source IP across every device and every day in the window, which no single
+// device's view, and no single run of the in-memory anomaly detector, can see.
 //
 // Every ranking has a fully deterministic order (primary key descending, then
 // an explicit tie-break), so the output can be diffed and the tests are not
-// flaky. Nothing here classifies or triages; the package deliberately does not
+// flaky, and the result does not depend on the order entries arrive in.
+// Nothing here classifies or triages; the package deliberately does not
 // import internal/pipeline or internal/triage.
 package report
 
@@ -62,7 +69,9 @@ const (
 	eventConfigChange     = "CONFIG_CHANGE"
 	eventAfterHoursChange = "AFTER_HOURS_CHANGE"
 	eventLoginFailure     = "LOGIN_FAILURE"
-	eventBruteForce       = "BRUTE_FORCE_ATTEMPT"
+	eventBruteForce       = "BRUTE_FORCE_ATTEMPT"    // derived: many failures on one device
+	eventPasswordSpray    = "PASSWORD_SPRAY_ATTEMPT" // derived: failures on several devices
+	eventUnknown          = "UNKNOWN"
 )
 
 // connectCommand is the DiagCmd.Command that triage records when it could not
@@ -108,6 +117,11 @@ type Options struct {
 	// Label is how the caller spelled the window ("7d", "today"). It is used
 	// in table headings only; when empty it is derived from Since and Until.
 	Label string
+
+	// Devices is netlog's current view of each device's collection health,
+	// from DeviceStatuses. It is a snapshot of now, not of the window, and is
+	// optional: without it the Device Health section is empty.
+	Devices []DeviceStatus
 }
 
 func (o Options) top() int {
@@ -117,15 +131,23 @@ func (o Options) top() int {
 	return o.Top
 }
 
-// Report is the result of Compute. Each field except Options is one section
-// and one key of the JSON output.
+// Report is the result of Compute or Builder.Build. Each field except Options
+// is one section and one key of the JSON output.
 type Report struct {
 	NoisyDevices         []DeviceFaultCount   `json:"noisy_devices"`
 	ChangeAccountability ChangeAccountability `json:"change_accountability"`
 	SecurityWatchlist    []WatchedSource      `json:"security_watchlist"`
 	VolumeByCategory     VolumeByCategory     `json:"volume_by_category"`
 	WeekOverWeek         *WeekOverWeek        `json:"week_over_week"` // null when not computed
-	IncidentClosure      IncidentClosure      `json:"incident_closure"`
+
+	// IncidentClosure is the "Triage Reach" section. Its JSON key predates the
+	// name: the section measures whether triage could reach the device, not
+	// whether the problem was resolved (that is what Outages is for).
+	IncidentClosure IncidentClosure `json:"incident_closure"`
+
+	Outages                Outages          `json:"outages"`
+	DeviceHealth           DeviceHealth     `json:"device_health"`
+	ClassificationCoverage []VendorCoverage `json:"classification_coverage"`
 
 	// Options is the (normalised) request the report answers. The table
 	// writer needs it for headings; it is not part of the JSON output.
@@ -162,10 +184,15 @@ type ChangeAccountability struct {
 
 // WatchedSource is one source IP in the security watchlist.
 type WatchedSource struct {
-	SourceIP      string   `json:"source_ip"`
-	DistinctHosts int      `json:"distinct_hosts"` // devices this IP failed to log in to
-	Events        int      `json:"events"`         // LOGIN_FAILURE + BRUTE_FORCE_ATTEMPT
-	Hostnames     []string `json:"hostnames"`
+	SourceIP      string `json:"source_ip"`
+	DistinctHosts int    `json:"distinct_hosts"` // devices this IP failed to log in to
+	Events        int    `json:"events"`         // LOGIN_FAILURE events
+	// Detections counts the events netlog derived from those failures
+	// (BRUTE_FORCE_ATTEMPT, PASSWORD_SPRAY_ATTEMPT). They are kept apart from
+	// Events because each one is a summary of failures already counted there,
+	// and adding it in would overstate the attack by one per detection.
+	Detections int      `json:"detections"`
+	Hostnames  []string `json:"hostnames"`
 }
 
 // VolumeByCategory maps a UTC day ("2006-01-02") to the number of events in
@@ -227,46 +254,309 @@ type IncidentClosure struct {
 	UnreachableHosts []UnreachableHost `json:"unreachable_hosts"`
 }
 
-// ==============================================================================
-// Compute
-// ==============================================================================
-
-// Compute builds the report for opts from entries and incidents. It does no
-// I/O and does not modify its arguments.
-//
-// Sections 1-4 and 6 cover [Since, Until]. The week-over-week section also
-// reads the equal-length window before Since, which is half-open, [Since-w,
-// Since), so an event exactly on the boundary is counted once, in the later
-// window.
-func Compute(entries []collector.LogEntry, incidents []collector.IncidentReport, opts Options) Report {
-	opts.Top = opts.top()
-
-	cur := make([]collector.LogEntry, 0, len(entries))
-	for _, e := range entries {
-		if inWindow(e.Timestamp, opts.Since, opts.Until) {
-			cur = append(cur, e)
-		}
-	}
-	inc := make([]collector.IncidentReport, 0, len(incidents))
-	for _, r := range incidents {
-		if inWindow(r.Timestamp, opts.Since, opts.Until) {
-			inc = append(inc, r)
-		}
-	}
-
-	rep := Report{
-		NoisyDevices:         noisyDevices(cur, opts.Top),
-		ChangeAccountability: changeAccountability(cur),
-		SecurityWatchlist:    securityWatchlist(cur, opts.Top),
-		VolumeByCategory:     volumeByCategory(cur, opts.Since, opts.Until),
-		IncidentClosure:      incidentClosure(inc),
-		Options:              opts,
-	}
-	if opts.Compare {
-		rep.WeekOverWeek = weekOverWeek(entries, opts.Since, opts.Until)
-	}
-	return rep
+// Outage is one interval during which a link, OSPF adjacency or BGP session
+// was down: from a "down" event to the next "up" event for the same object on
+// the same device.
+type Outage struct {
+	Hostname string     `json:"hostname"`
+	Kind     string     `json:"kind"`   // link | ospf | bgp
+	Object   string     `json:"object"` // the interface, or the neighbor / peer address
+	Down     time.Time  `json:"down"`
+	Up       *time.Time `json:"up"` // null while still down at the end of the window
+	// DurationSeconds runs from Down to Up. For an outage still open it runs
+	// to the end of the window, so it is a lower bound.
+	DurationSeconds int64 `json:"duration_seconds"`
+	Open            bool  `json:"open"`
 }
+
+// Outages summarises the outages in the window.
+type Outages struct {
+	Total    int `json:"total"`
+	Resolved int `json:"resolved"`
+	Open     int `json:"open"`
+
+	// MeanSecondsToRecover is the arithmetic mean over resolved outages only
+	// (0 when there are none). LongestSeconds is over all of them.
+	MeanSecondsToRecover int64 `json:"mean_seconds_to_recover"`
+	LongestSeconds       int64 `json:"longest_seconds"`
+
+	// Untracked counts "down" events whose log line names no interface or
+	// neighbor, so no recovery can be matched to them.
+	Untracked int `json:"untracked"`
+
+	// Longest is the top-N outages by duration, open ones included.
+	Longest []Outage `json:"longest"`
+}
+
+// VendorCoverage is how much of one vendor's log netlog understands.
+type VendorCoverage struct {
+	Vendor string `json:"vendor"`
+	Lines  int    `json:"lines"`
+	// Unclassified counts lines the classifier left as UNKNOWN. A high share
+	// means the vendor's log has events netlog has no rule for.
+	Unclassified    int     `json:"unclassified"`
+	UnclassifiedPct float64 `json:"unclassified_pct"`
+}
+
+// ==============================================================================
+// Builder
+// ==============================================================================
+
+// Compute builds the report for opts from entries and incidents. It is
+// NewBuilder, AddEntry for each entry, AddIncident for each incident and
+// Build; it does no I/O and does not modify its arguments.
+func Compute(entries []collector.LogEntry, incidents []collector.IncidentReport, opts Options) Report {
+	b := NewBuilder(opts)
+	for _, e := range entries {
+		b.AddEntry(e)
+	}
+	for _, r := range incidents {
+		b.AddIncident(r)
+	}
+	return b.Build()
+}
+
+// Builder accumulates a Report one entry at a time. Entries may arrive in any
+// order and outside the window (they are ignored), so a caller can stream
+// everything query.Scan yields. The window rules are:
+//
+// Sections 1-4 and 6-9 cover [Since, Until], both ends inclusive. The
+// week-over-week section also reads the equal-length window before Since,
+// which is half-open, [Since-w, Since), so an event exactly on the boundary
+// is counted once, in the later window.
+//
+// A Builder is not safe for concurrent use.
+type Builder struct {
+	opts Options
+
+	compare  bool      // week-over-week is wanted and the window is bounded
+	prevFrom time.Time // start of the previous window (compare only)
+	prev     map[string]int
+	cur      map[string]int
+
+	faults map[string]int // FAULT events per device
+
+	changeTotal int
+	changes     map[string]*changeTally
+	afterHours  []AfterHoursChange
+
+	watch map[string]*watchTally
+
+	volume      map[string]map[string]int
+	volumeKnown int       // current-window entries in one of the five categories
+	first, last time.Time // earliest / latest current-window entry
+	seen        bool
+
+	coverage map[string]*coverageTally
+
+	outageEvents []outageEvent
+	untracked    int
+
+	incidents     IncidentClosure
+	incidentHosts map[string]*incidentTally
+}
+
+type changeTally struct{ total, afterHours int }
+
+type watchTally struct {
+	hosts      map[string]struct{}
+	events     int
+	detections int
+}
+
+type coverageTally struct{ lines, unknown int }
+
+type incidentTally struct{ incidents, unreachable int }
+
+type outageEvent struct {
+	host, kind, object string
+	at                 time.Time
+	up                 bool
+}
+
+// outageKinds maps the paired state-change events to the kind of thing that
+// went down and whether the event is the recovery.
+var outageKinds = map[string]struct {
+	kind string
+	up   bool
+}{
+	"LINK_DOWN":     {"link", false},
+	"LINK_UP":       {"link", true},
+	"OSPF_ADJ_DOWN": {"ospf", false},
+	"OSPF_ADJ_UP":   {"ospf", true},
+	"BGP_PEER_DOWN": {"bgp", false},
+	"BGP_PEER_UP":   {"bgp", true},
+}
+
+// NewBuilder returns a Builder for opts.
+func NewBuilder(opts Options) *Builder {
+	opts.Top = opts.top()
+	b := &Builder{
+		opts:          opts,
+		faults:        make(map[string]int),
+		changes:       make(map[string]*changeTally),
+		watch:         make(map[string]*watchTally),
+		volume:        make(map[string]map[string]int),
+		coverage:      make(map[string]*coverageTally),
+		incidentHosts: make(map[string]*incidentTally),
+	}
+	if opts.Compare && !opts.Since.IsZero() && !opts.Until.IsZero() && opts.Until.After(opts.Since) {
+		b.compare = true
+		b.prevFrom = opts.Since.Add(-opts.Until.Sub(opts.Since))
+		b.prev = make(map[string]int, len(categories))
+		b.cur = make(map[string]int, len(categories))
+	}
+	return b
+}
+
+// AddEntry feeds one log entry to every section it belongs to.
+func (b *Builder) AddEntry(e collector.LogEntry) {
+	ts := e.Timestamp
+	inCur := inWindow(ts, b.opts.Since, b.opts.Until)
+
+	cat := categoryOf(e)
+	if b.compare && isCategory(cat) {
+		switch {
+		case inCur:
+			b.cur[cat]++
+		case !ts.Before(b.prevFrom) && ts.Before(b.opts.Since):
+			b.prev[cat]++
+		}
+	}
+	if !inCur {
+		return
+	}
+
+	if !b.seen || ts.Before(b.first) {
+		b.first = ts
+	}
+	if !b.seen || ts.After(b.last) {
+		b.last = ts
+	}
+	b.seen = true
+
+	// 1. noisy devices
+	if cat == collector.CategoryFault {
+		b.faults[e.Hostname]++
+	}
+
+	// 2. change accountability
+	switch e.Event {
+	case eventConfigChange, eventAfterHoursChange:
+		after := e.Event == eventAfterHoursChange
+		u := userKey(e.User)
+		t := b.changes[u]
+		if t == nil {
+			t = &changeTally{}
+			b.changes[u] = t
+		}
+		t.total++
+		b.changeTotal++
+		if after {
+			t.afterHours++
+			b.afterHours = append(b.afterHours, AfterHoursChange{Hostname: e.Hostname, User: u, Timestamp: ts.UTC()})
+		}
+	}
+
+	// 3. security watchlist
+	switch e.Event {
+	case eventLoginFailure, eventBruteForce, eventPasswordSpray:
+		if ip := strings.TrimSpace(e.SourceIP); ip != "" {
+			t := b.watch[ip]
+			if t == nil {
+				t = &watchTally{hosts: make(map[string]struct{})}
+				b.watch[ip] = t
+			}
+			t.hosts[e.Hostname] = struct{}{}
+			if e.Event == eventLoginFailure {
+				t.events++
+			} else {
+				t.detections++
+			}
+		}
+	}
+
+	// 4. event volume
+	if isCategory(cat) {
+		b.volumeKnown++
+		day := ts.UTC().Format(dayLayout)
+		row := b.volume[day]
+		if row == nil {
+			row = make(map[string]int, len(categories))
+			b.volume[day] = row
+		}
+		row[cat]++
+	}
+
+	// 7. outages
+	if k, ok := outageKinds[e.Event]; ok {
+		if e.Object == "" {
+			if !k.up {
+				b.untracked++
+			}
+		} else {
+			b.outageEvents = append(b.outageEvents, outageEvent{host: e.Hostname, kind: k.kind, object: e.Object, at: ts, up: k.up})
+		}
+	}
+
+	// 9. classification coverage
+	v := strings.TrimSpace(e.Vendor)
+	if v == "" {
+		v = "(unknown)"
+	}
+	c := b.coverage[v]
+	if c == nil {
+		c = &coverageTally{}
+		b.coverage[v] = c
+	}
+	c.lines++
+	if e.Event == eventUnknown || e.Event == "" {
+		c.unknown++
+	}
+}
+
+// AddIncident feeds one incident report to the triage-reach section.
+func (b *Builder) AddIncident(r collector.IncidentReport) {
+	if !inWindow(r.Timestamp, b.opts.Since, b.opts.Until) {
+		return
+	}
+	t := b.incidentHosts[r.Hostname]
+	if t == nil {
+		t = &incidentTally{}
+		b.incidentHosts[r.Hostname] = t
+	}
+	t.incidents++
+	b.incidents.Total++
+	switch classify(r) {
+	case outcomeUnreachable:
+		b.incidents.Unreachable++
+		t.unreachable++
+	case outcomePartial:
+		b.incidents.PartialFailure++
+	default:
+		b.incidents.Succeeded++
+	}
+}
+
+// Build finishes the report. It can be called more than once.
+func (b *Builder) Build() Report {
+	return Report{
+		NoisyDevices:           b.noisyDevices(),
+		ChangeAccountability:   b.changeAccountability(),
+		SecurityWatchlist:      b.securityWatchlist(),
+		VolumeByCategory:       b.volumeByCategory(),
+		WeekOverWeek:           b.weekOverWeek(),
+		IncidentClosure:        b.incidentClosure(),
+		Outages:                b.outages(),
+		DeviceHealth:           buildDeviceHealth(b.opts.Devices),
+		ClassificationCoverage: b.classificationCoverage(),
+		Options:                b.opts,
+	}
+}
+
+// ==============================================================================
+// Shared helpers
+// ==============================================================================
 
 // inWindow reports whether ts lies in [since, until]; a zero bound is open.
 func inWindow(ts, since, until time.Time) bool {
@@ -346,20 +636,23 @@ func pct(n, total int) float64 {
 	return round1(float64(n) * 100 / float64(total))
 }
 
+func userKey(u string) string {
+	if strings.TrimSpace(u) == "" {
+		return UnknownUser
+	}
+	return u
+}
+
+const dayLayout = "2006-01-02"
+
 // ==============================================================================
 // 1. Noisy devices
 // ==============================================================================
 
-// noisyDevices counts FAULT events per device, most first, ties by hostname.
-func noisyDevices(entries []collector.LogEntry, top int) []DeviceFaultCount {
-	counts := make(map[string]int)
-	for _, e := range entries {
-		if categoryOf(e) == collector.CategoryFault {
-			counts[e.Hostname]++
-		}
-	}
-	out := make([]DeviceFaultCount, 0, len(counts))
-	for host, n := range counts {
+// noisyDevices ranks devices by FAULT events, most first, ties by hostname.
+func (b *Builder) noisyDevices() []DeviceFaultCount {
+	out := make([]DeviceFaultCount, 0, len(b.faults))
+	for host, n := range b.faults {
 		out = append(out, DeviceFaultCount{Hostname: host, Count: n})
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -368,69 +661,44 @@ func noisyDevices(entries []collector.LogEntry, top int) []DeviceFaultCount {
 		}
 		return lessFold(out[i].Hostname, out[j].Hostname)
 	})
-	return limit(out, top)
+	return limit(out, b.opts.Top)
 }
 
 // ==============================================================================
 // 2. Change accountability
 // ==============================================================================
 
-func userKey(u string) string {
-	if strings.TrimSpace(u) == "" {
-		return UnknownUser
-	}
-	return u
-}
-
-// changeAccountability counts CONFIG_CHANGE and AFTER_HOURS_CHANGE events per
-// user. The (unknown) bucket sorts last whatever its count.
-func changeAccountability(entries []collector.LogEntry) ChangeAccountability {
-	type tally struct{ total, afterHours int }
-	byUser := make(map[string]*tally)
-	ca := ChangeAccountability{ByUser: []UserChangeCount{}, AfterHours: []AfterHoursChange{}}
-
-	for _, e := range entries {
-		after := e.Event == eventAfterHoursChange
-		if e.Event != eventConfigChange && !after {
-			continue
-		}
-		u := userKey(e.User)
-		t := byUser[u]
-		if t == nil {
-			t = &tally{}
-			byUser[u] = t
-		}
-		t.total++
-		ca.Total++
-		if after {
-			t.afterHours++
-			ca.AfterHours = append(ca.AfterHours, AfterHoursChange{Hostname: e.Hostname, User: u, Timestamp: e.Timestamp.UTC()})
-		}
+// changeAccountability orders users by change count. The (unknown) bucket
+// sorts last whatever its count.
+func (b *Builder) changeAccountability() ChangeAccountability {
+	ca := ChangeAccountability{
+		Total:      b.changeTotal,
+		ByUser:     make([]UserChangeCount, 0, len(b.changes)),
+		AfterHours: append([]AfterHoursChange{}, b.afterHours...),
 	}
 	ca.AfterHoursCount = len(ca.AfterHours)
-
-	for u, t := range byUser {
+	for u, t := range b.changes {
 		ca.ByUser = append(ca.ByUser, UserChangeCount{User: u, Count: t.total, AfterHours: t.afterHours})
 	}
 	sort.Slice(ca.ByUser, func(i, j int) bool {
-		a, b := ca.ByUser[i], ca.ByUser[j]
-		if (a.User == UnknownUser) != (b.User == UnknownUser) {
-			return b.User == UnknownUser
+		a, c := ca.ByUser[i], ca.ByUser[j]
+		if (a.User == UnknownUser) != (c.User == UnknownUser) {
+			return c.User == UnknownUser
 		}
-		if a.Count != b.Count {
-			return a.Count > b.Count
+		if a.Count != c.Count {
+			return a.Count > c.Count
 		}
-		return lessFold(a.User, b.User)
+		return lessFold(a.User, c.User)
 	})
 	sort.Slice(ca.AfterHours, func(i, j int) bool {
-		a, b := ca.AfterHours[i], ca.AfterHours[j]
-		if !a.Timestamp.Equal(b.Timestamp) {
-			return a.Timestamp.After(b.Timestamp)
+		a, c := ca.AfterHours[i], ca.AfterHours[j]
+		if !a.Timestamp.Equal(c.Timestamp) {
+			return a.Timestamp.After(c.Timestamp)
 		}
-		if a.Hostname != b.Hostname {
-			return lessFold(a.Hostname, b.Hostname)
+		if a.Hostname != c.Hostname {
+			return lessFold(a.Hostname, c.Hostname)
 		}
-		return lessFold(a.User, b.User)
+		return lessFold(a.User, c.User)
 	})
 	return ca
 }
@@ -439,115 +707,65 @@ func changeAccountability(entries []collector.LogEntry) ChangeAccountability {
 // 3. Security watchlist
 // ==============================================================================
 
-// securityWatchlist groups LOGIN_FAILURE and BRUTE_FORCE_ATTEMPT events by
-// source IP across the whole fleet and ranks each IP by how many distinct
-// devices it touched, then by total events, then by address.
-func securityWatchlist(entries []collector.LogEntry, top int) []WatchedSource {
-	type tally struct {
-		hosts  map[string]struct{}
-		events int
-	}
-	byIP := make(map[string]*tally)
-	for _, e := range entries {
-		if e.Event != eventLoginFailure && e.Event != eventBruteForce {
-			continue
-		}
-		ip := strings.TrimSpace(e.SourceIP)
-		if ip == "" {
-			continue
-		}
-		t := byIP[ip]
-		if t == nil {
-			t = &tally{hosts: make(map[string]struct{})}
-			byIP[ip] = t
-		}
-		t.hosts[e.Hostname] = struct{}{}
-		t.events++
-	}
-
-	out := make([]WatchedSource, 0, len(byIP))
-	for ip, t := range byIP {
+// securityWatchlist ranks each source IP by how many distinct devices it
+// touched, then by failed logins, then by detections, then by address.
+func (b *Builder) securityWatchlist() []WatchedSource {
+	out := make([]WatchedSource, 0, len(b.watch))
+	for ip, t := range b.watch {
 		hosts := make([]string, 0, len(t.hosts))
 		for h := range t.hosts {
 			hosts = append(hosts, h)
 		}
 		sort.Slice(hosts, func(i, j int) bool { return lessFold(hosts[i], hosts[j]) })
-		out = append(out, WatchedSource{SourceIP: ip, DistinctHosts: len(hosts), Events: t.events, Hostnames: hosts})
+		out = append(out, WatchedSource{SourceIP: ip, DistinctHosts: len(hosts), Events: t.events, Detections: t.detections, Hostnames: hosts})
 	}
 	sort.Slice(out, func(i, j int) bool {
-		a, b := out[i], out[j]
-		if a.DistinctHosts != b.DistinctHosts {
-			return a.DistinctHosts > b.DistinctHosts
+		a, c := out[i], out[j]
+		if a.DistinctHosts != c.DistinctHosts {
+			return a.DistinctHosts > c.DistinctHosts
 		}
-		if a.Events != b.Events {
-			return a.Events > b.Events
+		if a.Events != c.Events {
+			return a.Events > c.Events
 		}
-		return lessIP(a.SourceIP, b.SourceIP)
+		if a.Detections != c.Detections {
+			return a.Detections > c.Detections
+		}
+		return lessIP(a.SourceIP, c.SourceIP)
 	})
-	return limit(out, top)
+	return limit(out, b.opts.Top)
 }
 
 // ==============================================================================
 // 4. Event volume by category and day
 // ==============================================================================
 
-const dayLayout = "2006-01-02"
-
 // volumeByCategory counts events per UTC day and category. Every UTC day from
 // the window's start to its end gets a row, including days with no events, so
 // a gap in collection is visible rather than silently skipped. A window with
 // no events yields an empty (non-nil) map.
-func volumeByCategory(entries []collector.LogEntry, since, until time.Time) VolumeByCategory {
+func (b *Builder) volumeByCategory() VolumeByCategory {
 	vol := VolumeByCategory{}
-	total := 0
-	for _, e := range entries {
-		if isCategory(categoryOf(e)) {
-			total++
-		}
-	}
-	if total == 0 {
+	if b.volumeKnown == 0 {
 		return vol
 	}
-
 	// An open end of the window falls back to the first/last entry.
-	start, end := since, until
-	if start.IsZero() || end.IsZero() {
-		first, last := entries[0].Timestamp, entries[0].Timestamp
-		for _, e := range entries[1:] {
-			if e.Timestamp.Before(first) {
-				first = e.Timestamp
-			}
-			if e.Timestamp.After(last) {
-				last = e.Timestamp
-			}
-		}
-		if start.IsZero() {
-			start = first
-		}
-		if end.IsZero() {
-			end = last
-		}
+	start, end := b.opts.Since, b.opts.Until
+	if start.IsZero() {
+		start = b.first
+	}
+	if end.IsZero() {
+		end = b.last
 	}
 
 	day := start.UTC().Truncate(24 * time.Hour)
-	last := end.UTC().Truncate(24 * time.Hour)
-	for n := 0; !day.After(last) && n < maxVolumeDays; n++ {
+	lastDay := end.UTC().Truncate(24 * time.Hour)
+	for n := 0; !day.After(lastDay) && n < maxVolumeDays; n++ {
 		row := make(map[string]int, len(categories))
 		for _, c := range categories {
-			row[c] = 0
+			row[c] = b.volume[day.Format(dayLayout)][c]
 		}
 		vol[day.Format(dayLayout)] = row
 		day = day.AddDate(0, 0, 1)
-	}
-
-	for _, e := range entries {
-		c := categoryOf(e)
-		if !isCategory(c) {
-			continue
-		}
-		if row, ok := vol[e.Timestamp.UTC().Format(dayLayout)]; ok {
-			row[c]++
-		}
 	}
 	return vol
 }
@@ -556,43 +774,26 @@ func volumeByCategory(entries []collector.LogEntry, since, until time.Time) Volu
 // 5. Week-over-week delta
 // ==============================================================================
 
-// weekOverWeek compares per-category event counts in [since, until] with the
-// equal-length window before it, [since-w, since). It is the only statistic in
+// weekOverWeek compares per-category event counts in [Since, Until] with the
+// equal-length window before it, [Since-w, Since). It is the only statistic in
 // the report: (current - previous) / previous * 100, and nil when previous is
 // zero rather than a division by zero or an infinity. It returns nil when the
-// window is not fully bounded.
-func weekOverWeek(entries []collector.LogEntry, since, until time.Time) *WeekOverWeek {
-	if since.IsZero() || until.IsZero() || !until.After(since) {
+// comparison was not requested or the window is not fully bounded.
+func (b *Builder) weekOverWeek() *WeekOverWeek {
+	if !b.compare {
 		return nil
 	}
-	prevFrom := since.Add(-until.Sub(since))
-
-	prev := make(map[string]int, len(categories))
-	cur := make(map[string]int, len(categories))
-	for _, e := range entries {
-		c := categoryOf(e)
-		if !isCategory(c) {
-			continue
-		}
-		switch {
-		case !e.Timestamp.Before(since) && !e.Timestamp.After(until):
-			cur[c]++
-		case !e.Timestamp.Before(prevFrom) && e.Timestamp.Before(since):
-			prev[c]++
-		}
-	}
-
 	w := &WeekOverWeek{
-		PreviousFrom: prevFrom.UTC(),
-		CurrentFrom:  since.UTC(),
-		CurrentTo:    until.UTC(),
+		PreviousFrom: b.prevFrom.UTC(),
+		CurrentFrom:  b.opts.Since.UTC(),
+		CurrentTo:    b.opts.Until.UTC(),
 		Categories:   make([]CategoryDelta, 0, len(categories)),
 	}
 	var prevTotal, curTotal int
 	for _, c := range categories {
-		w.Categories = append(w.Categories, delta(c, prev[c], cur[c]))
-		prevTotal += prev[c]
-		curTotal += cur[c]
+		w.Categories = append(w.Categories, delta(c, b.prev[c], b.cur[c]))
+		prevTotal += b.prev[c]
+		curTotal += b.cur[c]
 	}
 	w.Total = delta("TOTAL", prevTotal, curTotal)
 	return w
@@ -608,7 +809,7 @@ func delta(category string, previous, current int) CategoryDelta {
 }
 
 // ==============================================================================
-// 6. Incident closure
+// 6. Triage reach
 // ==============================================================================
 
 type outcome int
@@ -640,34 +841,14 @@ func classify(r collector.IncidentReport) outcome {
 
 // incidentClosure reports how many incidents triage could not reach the
 // device for, and which devices those were.
-func incidentClosure(incidents []collector.IncidentReport) IncidentClosure {
-	type tally struct{ incidents, unreachable int }
-	hosts := make(map[string]*tally)
-	ic := IncidentClosure{UnreachableHosts: []UnreachableHost{}}
-
-	for _, r := range incidents {
-		t := hosts[r.Hostname]
-		if t == nil {
-			t = &tally{}
-			hosts[r.Hostname] = t
-		}
-		t.incidents++
-		ic.Total++
-		switch classify(r) {
-		case outcomeUnreachable:
-			ic.Unreachable++
-			t.unreachable++
-		case outcomePartial:
-			ic.PartialFailure++
-		default:
-			ic.Succeeded++
-		}
-	}
+func (b *Builder) incidentClosure() IncidentClosure {
+	ic := b.incidents
+	ic.UnreachableHosts = []UnreachableHost{}
 	ic.SucceededPct = pct(ic.Succeeded, ic.Total)
 	ic.UnreachablePct = pct(ic.Unreachable, ic.Total)
 	ic.PartialFailurePct = pct(ic.PartialFailure, ic.Total)
 
-	for host, t := range hosts {
+	for host, t := range b.incidentHosts {
 		if t.unreachable == 0 {
 			continue
 		}
@@ -676,11 +857,128 @@ func incidentClosure(incidents []collector.IncidentReport) IncidentClosure {
 		})
 	}
 	sort.Slice(ic.UnreachableHosts, func(i, j int) bool {
-		a, b := ic.UnreachableHosts[i], ic.UnreachableHosts[j]
-		if a.Unreachable != b.Unreachable {
-			return a.Unreachable > b.Unreachable
+		a, c := ic.UnreachableHosts[i], ic.UnreachableHosts[j]
+		if a.Unreachable != c.Unreachable {
+			return a.Unreachable > c.Unreachable
 		}
-		return lessFold(a.Hostname, b.Hostname)
+		return lessFold(a.Hostname, c.Hostname)
 	})
 	return ic
+}
+
+// ==============================================================================
+// 7. Outages
+// ==============================================================================
+
+// outages pairs every "down" with the next "up" for the same device, kind and
+// object. A second "down" while one is open is ignored (Cisco logs both the
+// link and the line protocol for one event), as is an "up" with nothing open
+// (the outage began before the window). What is still open at the end of the
+// window is reported as open.
+func (b *Builder) outages() Outages {
+	events := append([]outageEvent(nil), b.outageEvents...)
+	sort.Slice(events, func(i, j int) bool {
+		a, c := events[i], events[j]
+		switch {
+		case a.host != c.host:
+			return a.host < c.host
+		case a.kind != c.kind:
+			return a.kind < c.kind
+		case a.object != c.object:
+			return a.object < c.object
+		case !a.at.Equal(c.at):
+			return a.at.Before(c.at)
+		}
+		return !a.up && c.up // within one instant a down precedes its up
+	})
+
+	end := b.opts.Until
+	if end.IsZero() {
+		end = b.last
+	}
+
+	var all []Outage
+	var open *Outage
+	flush := func() {
+		if open != nil {
+			if d := end.Sub(open.Down); d > 0 {
+				open.DurationSeconds = int64(d / time.Second)
+			}
+			open.Open = true
+			all = append(all, *open)
+			open = nil
+		}
+	}
+	for i, e := range events {
+		if i > 0 && (e.host != events[i-1].host || e.kind != events[i-1].kind || e.object != events[i-1].object) {
+			flush()
+		}
+		switch {
+		case !e.up && open == nil:
+			open = &Outage{Hostname: e.host, Kind: e.kind, Object: e.object, Down: e.at.UTC()}
+		case e.up && open != nil:
+			up := e.at.UTC()
+			open.Up = &up
+			open.DurationSeconds = int64(e.at.Sub(open.Down.UTC()) / time.Second)
+			all = append(all, *open)
+			open = nil
+		}
+	}
+	flush()
+
+	res := Outages{Total: len(all), Untracked: b.untracked, Longest: []Outage{}}
+	var sum int64
+	for _, o := range all {
+		if o.Open {
+			res.Open++
+		} else {
+			res.Resolved++
+			sum += o.DurationSeconds
+		}
+		if o.DurationSeconds > res.LongestSeconds {
+			res.LongestSeconds = o.DurationSeconds
+		}
+	}
+	if res.Resolved > 0 {
+		res.MeanSecondsToRecover = int64(math.Round(float64(sum) / float64(res.Resolved)))
+	}
+
+	sort.Slice(all, func(i, j int) bool {
+		a, c := all[i], all[j]
+		switch {
+		case a.DurationSeconds != c.DurationSeconds:
+			return a.DurationSeconds > c.DurationSeconds
+		case a.Hostname != c.Hostname:
+			return lessFold(a.Hostname, c.Hostname)
+		case a.Kind != c.Kind:
+			return a.Kind < c.Kind
+		case a.Object != c.Object:
+			return a.Object < c.Object
+		}
+		return a.Down.Before(c.Down)
+	})
+	res.Longest = append(res.Longest, limit(all, b.opts.Top)...)
+	return res
+}
+
+// ==============================================================================
+// 9. Classification coverage
+// ==============================================================================
+
+// classificationCoverage reports, per vendor, how many lines the classifier
+// left as UNKNOWN, worst first. It is how to tell which vendor's log needs
+// more rules.
+func (b *Builder) classificationCoverage() []VendorCoverage {
+	out := make([]VendorCoverage, 0, len(b.coverage))
+	for v, c := range b.coverage {
+		out = append(out, VendorCoverage{Vendor: v, Lines: c.lines, Unclassified: c.unknown, UnclassifiedPct: pct(c.unknown, c.lines)})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		a, c := out[i], out[j]
+		if a.Unclassified != c.Unclassified {
+			return a.Unclassified > c.Unclassified
+		}
+		return lessFold(a.Vendor, c.Vendor)
+	})
+	return out
 }

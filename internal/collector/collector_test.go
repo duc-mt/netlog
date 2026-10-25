@@ -12,6 +12,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"net"
 	"strconv"
 	"strings"
@@ -55,9 +56,18 @@ func TestPlansAndID(t *testing.T) {
 			t.Fatalf("%s -> %s %v", in, k, err)
 		}
 	}
-	for _, v := range []string{"pfsense", "checkpoint", "sophos"} {
-		if _, _, err := resolvePlan(inventory.Device{Vendor: v}); err == nil {
-			t.Fatalf("%s should be unsupported", v)
+	// Sophos is recognised by the vendor registry but has no fetch plan.
+	if _, _, err := resolvePlan(inventory.Device{Vendor: "sophos"}); !errors.Is(err, ErrUnsupportedVendor) {
+		t.Fatalf("sophos should be unsupported, got %v", err)
+	}
+	// pfSense and Check Point read plain-text syslog files with tail.
+	for in, want := range map[string]string{"pfsense": "pfsense", "checkpoint": "checkpoint_gaia", "gaia": "checkpoint_gaia"} {
+		k, plan, err := resolvePlan(inventory.Device{Vendor: in})
+		if err != nil || k != want || len(plan.Commands) != 1 || !strings.HasPrefix(plan.Commands[0], "tail ") || plan.Interactive {
+			t.Fatalf("%s -> %s %+v %v", in, k, plan, err)
+		}
+		if clockCommandFor(k) != "date" {
+			t.Fatalf("%s clock command %q, want date", k, clockCommandFor(k))
 		}
 	}
 	if clockCommandFor("cisco_asa") != "show clock" || clockCommandFor("vyos") != "date" {
@@ -161,7 +171,7 @@ func TestRunEndToEnd(t *testing.T) {
 	devs := []inventory.Device{
 		{Hostname: "sw1", Address: host, Port: port, Vendor: "cisco_ios", CredentialGroup: "default"},
 		{Hostname: "sw2", Address: host, Port: port, Vendor: "cisco", CredentialGroup: "default"},
-		{Hostname: "pf", Address: host, Port: port, Vendor: "pfsense", CredentialGroup: "default"},
+		{Hostname: "pf", Address: host, Port: port, Vendor: "sophos", CredentialGroup: "default"},
 		{Hostname: "dead", Address: "127.0.0.1", Port: 1, Vendor: "cisco_ios", CredentialGroup: "default"},
 	}
 	parser := func(vendorKey, out string, ref time.Time) (time.Time, error) {
@@ -201,9 +211,9 @@ func TestRunEndToEnd(t *testing.T) {
 		t.Fatal("dead should fail")
 	}
 	t.Logf("dead err: %v", got["dead"].Err)
-	// pfsense must not have opened any session: 2 devices * (log + clock) = 4 execs
+	// an unsupported vendor must not have opened any session: 2 devices * (log + clock) = 4 execs
 	if served.Load() != 4 {
-		t.Fatalf("served %d execs, want 4 (pfsense must not dial)", served.Load())
+		t.Fatalf("served %d execs, want 4 (an unsupported vendor must not dial)", served.Load())
 	}
 }
 

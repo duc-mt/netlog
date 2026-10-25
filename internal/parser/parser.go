@@ -90,6 +90,10 @@ func For(vendorKey string, opts Options) Parser {
 		p = &fortigateParser{key: vendorKey, opts: opts}
 	case "mikrotik":
 		p = &mikrotikParser{key: vendorKey, opts: opts}
+	case "pfsense":
+		p = &pfsenseParser{key: vendorKey, opts: opts}
+	case "checkpoint_gaia":
+		p = &gaiaParser{key: vendorKey, opts: opts}
 	default:
 		p = newGenericParser(vendorKey, opts)
 	}
@@ -432,7 +436,9 @@ var (
 	reUserWord    = regexp.MustCompile(`(?i)\buser\s+([A-Za-z0-9_.@-]+)\s+(?:logged|from|login)`)
 	reKVIP        = regexp.MustCompile(`(?i)\b(?:ip|ipaddress|srcip)="?([0-9a-f:.]+)`)
 	reKVTask      = regexp.MustCompile(`(?i)\b(?:task|session)=([^\s,)"]+)`)
-	reFromIP      = regexp.MustCompile(`(?i)\bfrom\s+(\d{1,3}(?:\.\d{1,3}){3})\b`)
+	reFromIP      = regexp.MustCompile(`(?i)\bfrom:?\s+(\d{1,3}(?:\.\d{1,3}){3})\b`)
+	reCfgUserAt   = regexp.MustCompile(`(?i)configuration chang(?:e|ed)[^:]*:\s*([^\s@:]+)@([0-9a-f:.]+)`)
+	reCmdBy       = regexp.MustCompile(`(?i)\bcmd by ([A-Za-z0-9_.@-]+):`)
 )
 
 // validIP returns s if it parses as an IP address (after trimming trailing
@@ -450,7 +456,9 @@ func validIP(s string) string {
 // nothing is guessed: if no pattern matches the fields stay empty.
 func attribute(e *collector.LogEntry, msg string) {
 	setUser := func(u string) {
-		if e.User == "" && u != "" {
+		// A quoted name ("user ' admin '") may carry padding; entries promise
+		// a trimmed user, and a blank one is no user at all.
+		if u = strings.TrimSpace(u); e.User == "" && u != "" {
 			e.User = u
 		}
 	}
@@ -525,6 +533,17 @@ func attribute(e *collector.LogEntry, msg string) {
 	if has("from") {
 		if m := reFromIP.FindStringSubmatch(msg); m != nil {
 			setSrc(m[1])
+		}
+	}
+	if has("configuration chang") { // pfSense: "Configuration Change: admin@10.0.0.5 (Local Database): ..."
+		if m := reCfgUserAt.FindStringSubmatch(msg); m != nil {
+			setUser(m[1])
+			setSrc(m[2])
+		}
+	}
+	if has("cmd by") { // Check Point Gaia clish: "cmd by admin: Start executing : set ..."
+		if m := reCmdBy.FindStringSubmatch(msg); m != nil {
+			setUser(m[1])
 		}
 	}
 }

@@ -56,6 +56,23 @@ const (
 	EventHighCPU          = "HIGH_CPU"
 	EventCLICommand       = "CLI_COMMAND"
 	EventUnknown          = "UNKNOWN"
+
+	// Recovery events: the "up" half of LINK_DOWN, OSPF_ADJ_DOWN and
+	// BGP_PEER_DOWN. They are SYSTEM/INFO, not FAULT, so they never count as
+	// faults; their job is to close an outage (see internal/report).
+	EventLinkUp    = "LINK_UP"
+	EventOSPFAdjUp = "OSPF_ADJ_UP"
+	EventBGPPeerUp = "BGP_PEER_UP"
+
+	// Further fault classes. None has a triage playbook yet, so they are
+	// stored and reported but start no diagnostics.
+	EventHAChange       = "HA_CHANGE"        // HA / cluster / failover state change
+	EventHardwareFault  = "HARDWARE_FAULT"   // power supply, fan, temperature
+	EventPortErrDisable = "PORT_ERR_DISABLE" // err-disable, port security, BPDU guard
+
+	// EventPasswordSpray is derived by the detector: one source address
+	// failing logins on several devices (see DetectorConfig.SprayDevices).
+	EventPasswordSpray = "PASSWORD_SPRAY_ATTEMPT"
 )
 
 // DefaultAfterHoursStart and DefaultAfterHoursEnd define the default 00:00-06:00 window.
@@ -77,13 +94,13 @@ func mk(pattern, category, event, severity string) rule {
 
 // rules is the ordered classification table; the first match wins.
 var rules = []rule{
-	mk(`config_i|commit\[|cmdrecord|ui_commit|cfgpath=`,
+	mk(`config_i|commit\[|cmdrecord|ui_commit|cfgpath=|configuration chang(?:e|ed)|clish\[\d+\]:\s*cmd by \S+:\s*start executing\s*:\s*(?:set|add|delete|remove|save|load)\b`,
 		collector.CategoryConfig, EventConfigChange, collector.SeverityWarning),
 
-	mk(`login[ _]success(?:ful)?|accepted (?:password|publickey|keyboard-interactive)|logged in (?:successfully|from)|succeeded in logging in`,
+	mk(`login[ _]success(?:ful)?|successful login|accepted (?:password|publickey|keyboard-interactive)|logged in (?:successfully|from)|succeeded in logging in`,
 		collector.CategoryAuth, EventLoginSuccess, collector.SeverityInfo),
 
-	mk(`authentication (?:failure|failed)|failed password|bad auth|login[ _]fail(?:ed|ure)|failed to log ?in|invalid user`,
+	mk(`authentication (?:failure|failed|error)|failed password|bad auth|login[ _]fail(?:ed|ure)|failed login|failed to log ?in|invalid user`,
 		collector.CategoryAuth, EventLoginFailure, collector.SeverityWarning),
 
 	mk(`ospf.*adjchg.*down|ospf.*neighbor.*down`,
@@ -98,8 +115,33 @@ var rules = []rule{
 	mk(`stp.*topology.change|spanning-tree.*tcn|spantree.*topo`,
 		collector.CategoryFault, EventSTPTCN, collector.SeverityWarning),
 
-	mk(`link-3-updown.*down|carrier.*down|interface.*down|link is down|link[ _]down|ifoperstatus down`,
+	// HA / cluster / failover. "subtype=ha" is a FortiGate HA event, "CLUS-"
+	// a Check Point ClusterXL state change, "Switching to Active/Standby" and
+	// "Failover" a Cisco ASA or generic failover pair. Best effort: the rule
+	// flags a state change, not which node is now active.
+	mk(`subtype="?ha\b"?|clus-\d+.*state change|\bfailover\b|switching to (?:active|standby)|\bha[ _](?:state|role)`,
+		collector.CategoryFault, EventHAChange, collector.SeverityWarning),
+
+	mk(`(?:power[ -]?supply|\bpsu\b|\bfans?\b|temperature|thermal|over-?heat).*(?:fail|fault|down|alarm|critical|exceed|too high|high|removed|stopp|shut ?down)`,
+		collector.CategoryFault, EventHardwareFault, collector.SeverityError),
+
+	mk(`err[-_ ]?disable|psecure[_-]violation|port[- ]security.*violation|bpdu ?guard|loop ?guard|root[ _]?inconsistent|storm[- ]control.*(?:shut|disabl|block)`,
+		collector.CategoryFault, EventPortErrDisable, collector.SeverityError),
+
+	mk(`link-3-updown.*down|carrier.*down|interface.*down|link is down|link[ _]down|ifoperstatus down|link state changed to down`,
 		collector.CategoryFault, EventLinkDown, collector.SeverityError),
+
+	// Recoveries. They come after every "down" rule, so a line that matches
+	// both (OSPF "from FULL to DOWN") is a down. OSPF needs "to FULL" so that
+	// "from FULL to LOADING" (an adjacency being torn down) is not an up.
+	mk(`ospf.*(?:nbrup|(?:to|->)\s*full\b)|ospf.*neighborcurrentstate=full`,
+		collector.CategorySystem, EventOSPFAdjUp, collector.SeverityInfo),
+
+	mk(`bgp.*adjchange.*\bup\b|bgp.*to established\b|bgp.*peer.*\bestablished\b`,
+		collector.CategorySystem, EventBGPPeerUp, collector.SeverityInfo),
+
+	mk(`changed state to up|link is up|link[ _]up|carrier (?:acquired|up)|ifoperstatus up|entered the up state|link state changed to up`,
+		collector.CategorySystem, EventLinkUp, collector.SeverityInfo),
 
 	mk(`cpu.*utilization.*[89][0-9]%|cpu.*100%`,
 		collector.CategorySystem, EventHighCPU, collector.SeverityWarning),
@@ -181,6 +223,8 @@ func (c *Classifier) Classify(e *collector.LogEntry) {
 		}
 	}
 
+	e.Object = objectOf(e.Event, e.Raw)
+
 	// Read-only Huawei CLI commands are not changes.
 	if e.Event == EventConfigChange && reCmdRecord.MatchString(e.Raw) {
 		if cmd := cmdRecordCommand(e.Raw); cmd != "" && reReadOnlyCmd.MatchString(cmd) {
@@ -192,6 +236,19 @@ func (c *Classifier) Classify(e *collector.LogEntry) {
 	if e.Category == collector.CategoryConfig && IsAfterHours(e.Timestamp.In(c.loc), c.afterHoursStart, c.afterHoursEnd) {
 		e.Category, e.Event, e.Severity = collector.CategorySecurity, EventAfterHoursChange, collector.SeverityCritical
 	}
+}
+
+// objectOf returns the interface or neighbor a state-change event is about,
+// or "" if the event has no object or the line does not name one. Only the
+// events that can be paired into an outage carry one.
+func objectOf(event, raw string) string {
+	switch event {
+	case EventLinkDown, EventLinkUp:
+		return ExtractInterface(raw)
+	case EventOSPFAdjDown, EventOSPFAdjUp, EventBGPPeerDown, EventBGPPeerUp:
+		return ExtractPeer(raw)
+	}
+	return ""
 }
 
 // ClassifyAll classifies every entry in place.

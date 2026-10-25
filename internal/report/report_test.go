@@ -12,6 +12,7 @@ import (
 	"math"
 	"math/rand"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -25,12 +26,27 @@ func mk(host, cat, event, user, srcIP string, ts time.Time) collector.LogEntry {
 	return collector.LogEntry{
 		ID: collector.EntryID(host, fmt.Sprint(event, user, srcIP, ts.UnixNano())), Hostname: host, Category: cat,
 		Severity: collector.SeverityInfo, Event: event, User: user, SourceIP: srcIP,
-		Summary: event, Raw: event, Timestamp: ts.UTC(),
+		Summary: event, Raw: event, Timestamp: ts.UTC(), Vendor: "cisco_ios",
 	}
 }
 
+// fault is a FAULT-category entry that is not a state change, so it never
+// takes part in outage pairing (use down/up for that).
 func fault(host string, ts time.Time) collector.LogEntry {
-	return mk(host, collector.CategoryFault, "LINK_DOWN", "", "", ts)
+	return mk(host, collector.CategoryFault, "HIGH_CPU", "", "", ts)
+}
+
+// down and up are the two halves of an outage of one object.
+func down(host, event, object string, ts time.Time) collector.LogEntry {
+	e := mk(host, collector.CategoryFault, event, "", "", ts)
+	e.Object = object
+	return e
+}
+
+func up(host, event, object string, ts time.Time) collector.LogEntry {
+	e := mk(host, collector.CategorySystem, event, "", "", ts)
+	e.Object = object
+	return e
 }
 
 func change(host, user string, ts time.Time) collector.LogEntry {
@@ -190,42 +206,52 @@ func TestSecurityWatchlist(t *testing.T) {
 		{"no entries", nil, 10, []WatchedSource{}},
 		{"empty source ip is skipped", []collector.LogEntry{loginFail("R1", "", t0), loginFail("R1", "  ", t0)}, 10, []WatchedSource{}},
 		{"single event", []collector.LogEntry{loginFail("R1", "1.1.1.1", t0)}, 10,
-			[]WatchedSource{{"1.1.1.1", 1, 1, []string{"R1"}}}},
+			[]WatchedSource{{"1.1.1.1", 1, 1, 0, []string{"R1"}}}},
 		{"distinct hosts outrank total events", cat(
 			repeat(9, func(int) collector.LogEntry { return loginFail("R1", "1.1.1.1", t0) }),    // 1 host, 9 events
 			[]collector.LogEntry{loginFail("R1", "2.2.2.2", t0), loginFail("R2", "2.2.2.2", t0)}, // 2 hosts, 2 events
 		), 10, []WatchedSource{
-			{"2.2.2.2", 2, 2, []string{"R1", "R2"}},
-			{"1.1.1.1", 1, 9, []string{"R1"}},
+			{"2.2.2.2", 2, 2, 0, []string{"R1", "R2"}},
+			{"1.1.1.1", 1, 9, 0, []string{"R1"}},
 		}},
 		{"equal hosts: more events first", cat(
 			repeat(3, func(int) collector.LogEntry { return loginFail("R1", "1.1.1.1", t0) }),
 			repeat(5, func(int) collector.LogEntry { return loginFail("R1", "2.2.2.2", t0) }),
 		), 10, []WatchedSource{
-			{"2.2.2.2", 1, 5, []string{"R1"}},
-			{"1.1.1.1", 1, 3, []string{"R1"}},
+			{"2.2.2.2", 1, 5, 0, []string{"R1"}},
+			{"1.1.1.1", 1, 3, 0, []string{"R1"}},
 		}},
 		{"full tie: addresses sort numerically, text last", []collector.LogEntry{
 			loginFail("R1", "10.0.0.10", t0), loginFail("R1", "10.0.0.9", t0),
 			loginFail("R1", "2001:db8::1", t0), loginFail("R1", "not-an-ip", t0), loginFail("R1", "9.255.255.255", t0),
 		}, 10, []WatchedSource{
-			{"9.255.255.255", 1, 1, []string{"R1"}},
-			{"10.0.0.9", 1, 1, []string{"R1"}},
-			{"10.0.0.10", 1, 1, []string{"R1"}},
-			{"2001:db8::1", 1, 1, []string{"R1"}},
-			{"not-an-ip", 1, 1, []string{"R1"}},
+			{"9.255.255.255", 1, 1, 0, []string{"R1"}},
+			{"10.0.0.9", 1, 1, 0, []string{"R1"}},
+			{"10.0.0.10", 1, 1, 0, []string{"R1"}},
+			{"2001:db8::1", 1, 1, 0, []string{"R1"}},
+			{"not-an-ip", 1, 1, 0, []string{"R1"}},
 		}},
-		{"brute force counts too, and the same host is counted once", []collector.LogEntry{
+		// The derived events summarise failures that are already counted as
+		// LOGIN_FAILURE entries: they are reported as detections and must not
+		// inflate the failure count (one per burst) or the host count.
+		{"detections are counted apart from failures", []collector.LogEntry{
 			loginFail("R1", "1.1.1.1", t0),
 			mk("R1", collector.CategorySecurity, "BRUTE_FORCE_ATTEMPT", "", "1.1.1.1", t0),
-			mk("R2", collector.CategorySecurity, "BRUTE_FORCE_ATTEMPT", "", "1.1.1.1", t0),
-		}, 10, []WatchedSource{{"1.1.1.1", 2, 3, []string{"R1", "R2"}}}},
+			mk("R2", collector.CategorySecurity, "PASSWORD_SPRAY_ATTEMPT", "", "1.1.1.1", t0),
+		}, 10, []WatchedSource{{"1.1.1.1", 2, 1, 2, []string{"R1", "R2"}}}},
+		{"detections break a tie on failures", []collector.LogEntry{
+			loginFail("R1", "1.1.1.1", t0), loginFail("R1", "2.2.2.2", t0),
+			mk("R1", collector.CategorySecurity, "BRUTE_FORCE_ATTEMPT", "", "2.2.2.2", t0),
+		}, 10, []WatchedSource{{"2.2.2.2", 1, 1, 1, []string{"R1"}}, {"1.1.1.1", 1, 1, 0, []string{"R1"}}}},
+		{"a source seen only through a detection is still listed", []collector.LogEntry{
+			mk("R1", collector.CategorySecurity, "BRUTE_FORCE_ATTEMPT", "", "1.1.1.1", t0),
+		}, 10, []WatchedSource{{"1.1.1.1", 1, 0, 1, []string{"R1"}}}},
 		{"other events with a source ip are not logins", []collector.LogEntry{
 			mk("R1", collector.CategoryConfig, "CONFIG_CHANGE", "tanvt", "10.10.10.50", t0),
 		}, 10, []WatchedSource{}},
 		{"top truncates after sorting", []collector.LogEntry{
 			loginFail("R1", "3.3.3.3", t0), loginFail("R1", "1.1.1.1", t0), loginFail("R1", "2.2.2.2", t0),
-		}, 2, []WatchedSource{{"1.1.1.1", 1, 1, []string{"R1"}}, {"2.2.2.2", 1, 1, []string{"R1"}}}},
+		}, 2, []WatchedSource{{"1.1.1.1", 1, 1, 0, []string{"R1"}}, {"2.2.2.2", 1, 1, 0, []string{"R1"}}}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -636,5 +662,253 @@ func TestComputeIsDeterministic(t *testing.T) {
 		if got := Compute(entries, incidents, opts); !reflect.DeepEqual(got, want) {
 			t.Fatalf("round %d: the report depends on input order\n got: %+v\nwant: %+v", round, got, want)
 		}
+	}
+}
+
+// ==============================================================================
+// 7. Outages
+// ==============================================================================
+
+var oEnd = t0 // window end
+
+func outages(entries ...collector.LogEntry) Outages {
+	return Compute(entries, nil, Options{Since: t0.Add(-Week), Until: oEnd}).Outages
+}
+
+func TestOutagePairing(t *testing.T) {
+	m := func(min int) time.Time { return t0.Add(-time.Duration(min) * time.Minute) }
+
+	t.Run("one down and its up", func(t *testing.T) {
+		o := outages(down("R1", "LINK_DOWN", "Gi0/1", m(60)), up("R1", "LINK_UP", "Gi0/1", m(50)))
+		if o.Total != 1 || o.Resolved != 1 || o.Open != 0 || o.MeanSecondsToRecover != 600 || o.LongestSeconds != 600 {
+			t.Fatalf("%+v", o)
+		}
+		x := o.Longest[0]
+		if x.Hostname != "R1" || x.Kind != "link" || x.Object != "Gi0/1" || x.Open || x.Up == nil || !x.Up.Equal(m(50)) || !x.Down.Equal(m(60)) || x.DurationSeconds != 600 {
+			t.Errorf("outage = %+v", x)
+		}
+	})
+
+	t.Run("still down at the end of the window", func(t *testing.T) {
+		o := outages(down("R1", "BGP_PEER_DOWN", "10.0.0.1", m(30)))
+		x := o.Longest[0]
+		if o.Open != 1 || o.Resolved != 0 || !x.Open || x.Up != nil || x.Kind != "bgp" || x.DurationSeconds != 1800 {
+			t.Errorf("open outage: %+v %+v", o, x)
+		}
+		if o.MeanSecondsToRecover != 0 {
+			t.Error("the mean is over resolved outages only")
+		}
+		if o.LongestSeconds != 1800 {
+			t.Errorf("an open outage counts towards the longest (a lower bound): %d", o.LongestSeconds)
+		}
+	})
+
+	// Cisco logs the link and the line protocol for one event, a second apart.
+	t.Run("a repeated down while open, and a repeated up, are one outage", func(t *testing.T) {
+		o := outages(
+			down("R1", "LINK_DOWN", "Gi0/1", m(60)), down("R1", "LINK_DOWN", "Gi0/1", m(60).Add(time.Second)),
+			up("R1", "LINK_UP", "Gi0/1", m(55)), up("R1", "LINK_UP", "Gi0/1", m(55).Add(time.Second)))
+		if o.Total != 1 || o.Resolved != 1 || o.LongestSeconds != 300 {
+			t.Errorf("%+v", o)
+		}
+	})
+
+	t.Run("an up with nothing open is ignored", func(t *testing.T) {
+		if o := outages(up("R1", "LINK_UP", "Gi0/1", m(10))); o.Total != 0 {
+			t.Errorf("a recovery from before the window is not an outage: %+v", o)
+		}
+	})
+
+	t.Run("a new down after a recovery is a second outage", func(t *testing.T) {
+		o := outages(
+			down("R1", "LINK_DOWN", "Gi0/1", m(100)), up("R1", "LINK_UP", "Gi0/1", m(90)),
+			down("R1", "LINK_DOWN", "Gi0/1", m(40)), up("R1", "LINK_UP", "Gi0/1", m(20)))
+		if o.Total != 2 || o.Resolved != 2 || o.MeanSecondsToRecover != 900 || o.LongestSeconds != 1200 {
+			t.Errorf("%+v", o)
+		}
+	})
+
+	t.Run("device, kind and object are all part of the key", func(t *testing.T) {
+		o := outages(
+			down("R1", "LINK_DOWN", "Gi0/1", m(60)),
+			up("R1", "LINK_UP", "Gi0/2", m(50)),     // other interface
+			up("R2", "LINK_UP", "Gi0/1", m(50)),     // other device
+			up("R1", "OSPF_ADJ_UP", "Gi0/1", m(50)), // other kind
+			up("R1", "BGP_PEER_UP", "Gi0/1", m(50))) // other kind
+		if o.Total != 1 || o.Open != 1 || o.Resolved != 0 {
+			t.Errorf("nothing here recovers the Gi0/1 link on R1: %+v", o)
+		}
+	})
+
+	t.Run("a down and up at the same instant: down first", func(t *testing.T) {
+		o := outages(up("R1", "LINK_UP", "Gi0/1", m(5)), down("R1", "LINK_DOWN", "Gi0/1", m(5)))
+		if o.Total != 1 || o.Resolved != 1 || o.LongestSeconds != 0 {
+			t.Errorf("%+v", o)
+		}
+	})
+
+	t.Run("outside the window", func(t *testing.T) {
+		before := t0.Add(-Week).Add(-time.Hour)
+		o := outages(down("R1", "LINK_DOWN", "Gi0/1", before), up("R1", "LINK_UP", "Gi0/1", before.Add(time.Minute)))
+		if o.Total != 0 {
+			t.Errorf("%+v", o)
+		}
+		// Down inside, up after the window: still open at the window's end.
+		o = outages(down("R1", "LINK_DOWN", "Gi0/1", m(30)), up("R1", "LINK_UP", "Gi0/1", t0.Add(time.Hour)))
+		if o.Open != 1 {
+			t.Errorf("%+v", o)
+		}
+	})
+
+	t.Run("a mean over resolved outages ignores the open ones", func(t *testing.T) {
+		o := outages(
+			down("R1", "LINK_DOWN", "Gi0/1", m(200)), up("R1", "LINK_UP", "Gi0/1", m(190)), // 10m
+			down("R1", "LINK_DOWN", "Gi0/2", m(180)), up("R1", "LINK_UP", "Gi0/2", m(160)), // 20m
+			down("R1", "LINK_DOWN", "Gi0/3", m(120))) // open, 2h
+		if o.Total != 3 || o.Resolved != 2 || o.Open != 1 || o.MeanSecondsToRecover != 900 || o.LongestSeconds != 7200 {
+			t.Errorf("%+v", o)
+		}
+	})
+}
+
+// A down whose line names no interface or neighbor cannot be matched to a
+// recovery: it is counted, not guessed at.
+func TestOutagesUntracked(t *testing.T) {
+	noObj := mk("R1", collector.CategoryFault, "LINK_DOWN", "", "", t0.Add(-time.Hour))
+	noObjUp := mk("R1", collector.CategorySystem, "LINK_UP", "", "", t0.Add(-50*time.Minute))
+	o := outages(noObj, noObjUp, noObj, down("R1", "LINK_DOWN", "Gi0/1", t0.Add(-time.Hour)), up("R1", "LINK_UP", "Gi0/1", t0.Add(-55*time.Minute)))
+	if o.Untracked != 2 || o.Total != 1 || o.Resolved != 1 {
+		t.Errorf("untracked downs are counted (recoveries are not), tracked ones still pair: %+v", o)
+	}
+}
+
+func TestOutagesLongestIsRankedAndTruncated(t *testing.T) {
+	var es []collector.LogEntry
+	for i, mins := range []int{5, 40, 40, 15} { // two equal durations on different devices
+		host := fmt.Sprintf("R%d", i+1)
+		es = append(es, down(host, "LINK_DOWN", "Gi0/1", t0.Add(-5*time.Hour)), up(host, "LINK_UP", "Gi0/1", t0.Add(-5*time.Hour+time.Duration(mins)*time.Minute)))
+	}
+	o := Compute(es, nil, Options{Since: t0.Add(-Week), Until: t0, Top: 3}).Outages
+	if o.Total != 4 || len(o.Longest) != 3 {
+		t.Fatalf("total %d, listed %d; want 4 outages, the top 3 listed", o.Total, len(o.Longest))
+	}
+	got := fmt.Sprintf("%s %s %s", o.Longest[0].Hostname, o.Longest[1].Hostname, o.Longest[2].Hostname)
+	if got != "R2 R3 R4" {
+		t.Errorf("order = %q, want longest first with ties by hostname", got)
+	}
+}
+
+func TestOutagesWithAnOpenWindowEndUseTheLatestEntry(t *testing.T) {
+	es := []collector.LogEntry{down("R1", "LINK_DOWN", "Gi0/1", t0.Add(-time.Hour)), fault("R2", t0.Add(-10*time.Minute))}
+	o := Compute(es, nil, Options{}).Outages
+	if o.Open != 1 || o.Longest[0].DurationSeconds != 3000 {
+		t.Errorf("an open window ends at the last entry seen: %+v", o)
+	}
+}
+
+// ==============================================================================
+// 9. Classification coverage
+// ==============================================================================
+
+func TestClassificationCoverage(t *testing.T) {
+	vend := func(v, event string) collector.LogEntry {
+		e := mk("R1", collector.CategorySystem, event, "", "", t0)
+		e.Vendor = v
+		return e
+	}
+	es := cat(
+		repeat(3, func(int) collector.LogEntry { return vend("pfsense", "UNKNOWN") }),
+		repeat(1, func(int) collector.LogEntry { return vend("pfsense", "CONFIG_CHANGE") }),
+		repeat(2, func(int) collector.LogEntry { return vend("cisco_ios", "UNKNOWN") }),
+		repeat(2, func(int) collector.LogEntry { return vend("cisco_ios", "LINK_UP") }),
+		repeat(1, func(int) collector.LogEntry { return vend("fortigate", "LOGIN_FAILURE") }),
+		repeat(1, func(int) collector.LogEntry { return vend("", "") }), // never classified, vendor unknown
+	)
+	got := Compute(es, nil, Options{}).ClassificationCoverage
+	want := []VendorCoverage{
+		{"pfsense", 4, 3, 75},
+		{"cisco_ios", 4, 2, 50},
+		{"(unknown)", 1, 1, 100}, // an entry with no event was never classified: it counts as unknown
+		{"fortigate", 1, 0, 0},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got  %+v\nwant %+v", got, want)
+	}
+	if empty := Compute(nil, nil, Options{}).ClassificationCoverage; empty == nil || len(empty) != 0 {
+		t.Errorf("no entries: want an empty, non-nil slice, got %#v", empty)
+	}
+}
+
+// ==============================================================================
+// 8. Device health
+// ==============================================================================
+
+func TestDeviceHealthSection(t *testing.T) {
+	rows := []DeviceStatus{
+		{Hostname: "ok-1", Status: "OK"},
+		{Hostname: "silent-1", Status: "SILENT"},
+		{Hostname: "failing-2", Status: "FAILING", ConsecutiveFailures: 2},
+		{Hostname: "failing-9", Status: "FAILING", ConsecutiveFailures: 9},
+		{Hostname: "ok-2", Status: "OK"},
+		{Hostname: "pf", Status: "UNSUPPORTED"},
+	}
+	dh := Compute(nil, nil, Options{Devices: rows}).DeviceHealth
+	if dh.Checked != 6 || len(dh.Unhealthy) != 4 {
+		t.Fatalf("%+v", dh)
+	}
+	var order []string
+	for _, d := range dh.Unhealthy {
+		order = append(order, d.Hostname)
+	}
+	// Most urgent first; within FAILING the longest run first; healthy devices are not listed.
+	if got := strings.Join(order, " "); got != "failing-9 failing-2 silent-1 pf" {
+		t.Errorf("order = %s", got)
+	}
+	if rows[0].Hostname != "ok-1" || rows[2].Hostname != "failing-2" {
+		t.Error("the caller's slice must not be reordered")
+	}
+
+	if dh := Compute(nil, nil, Options{}).DeviceHealth; dh.Checked != 0 || dh.Unhealthy == nil || len(dh.Unhealthy) != 0 {
+		t.Errorf("no health data: %+v (unhealthy must be an empty slice)", dh)
+	}
+}
+
+// ==============================================================================
+// Builder
+// ==============================================================================
+
+// Streaming and slices are the same computation, and a Builder can be asked
+// for its report more than once.
+func TestBuilderEqualsCompute(t *testing.T) {
+	day := 24 * time.Hour
+	entries := cat(
+		repeat(4, func(i int) collector.LogEntry { return fault("R1", t0.Add(-time.Duration(i)*time.Hour)) }),
+		[]collector.LogEntry{
+			change("R2", "alice", t0.Add(-day)), afterHours("R2", "bob", t0.Add(-2*day)), loginFail("R1", "9.9.9.9", t0.Add(-day)),
+			down("R1", "LINK_DOWN", "Gi0/1", t0.Add(-3*day)), up("R1", "LINK_UP", "Gi0/1", t0.Add(-3*day+time.Hour)),
+			fault("R1", t0.Add(-9*day)), // previous week
+		},
+	)
+	incidents := []collector.IncidentReport{incident("R1", t0.Add(-time.Hour), diagNoConn)}
+	opts := Options{Since: t0.Add(-Week), Until: t0, Compare: true, Top: 2, Devices: []DeviceStatus{{Hostname: "R1", Status: "FAILING"}}}
+
+	b := NewBuilder(opts)
+	for i := len(entries) - 1; i >= 0; i-- { // reverse order
+		b.AddEntry(entries[i])
+	}
+	for _, r := range incidents {
+		b.AddIncident(r)
+	}
+	first := b.Build()
+	if want := Compute(entries, incidents, opts); !reflect.DeepEqual(first, want) {
+		t.Fatalf("builder and Compute disagree\n got: %+v\nwant: %+v", first, want)
+	}
+	if again := b.Build(); !reflect.DeepEqual(first, again) {
+		t.Error("Build must be repeatable")
+	}
+	// Adding more afterwards is reflected.
+	b.AddEntry(fault("R9", t0))
+	if after := b.Build(); len(after.NoisyDevices) != 2 || after.NoisyDevices[0].Hostname != "R1" && after.NoisyDevices[1].Hostname != "R9" {
+		t.Errorf("entries added after a Build must count: %+v", after.NoisyDevices)
 	}
 }

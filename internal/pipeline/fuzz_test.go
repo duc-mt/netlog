@@ -49,6 +49,11 @@ func FuzzClassifyAndExtract(f *testing.F) {
 		`Oct 20 2026 09:31:02+07:00 H %%01SHELL/6/CMDRECORD(s)[9]:Record command information. (Task=VTY0, Command="dis cu")`,
 		"bgpd: %ADJCHANGE: neighbor 192.0.2.2 in vrf default Down",
 		"ifName ge-0/0/1 eth1:10.0.0.1 Interface 1/1/24",
+		"%OSPF-5-ADJCHG: Process 1, Nbr 10.255.255.4 on Gi0/1 from LOADING to FULL, Loading Done",
+		"%BGP-5-ADJCHANGE: neighbor 10.0.0.1 Up",
+		"kernel: igb0: link state changed to DOWN",
+		"kernel: [fw4_0];CLUS-114904-1: State change: Active -> Standby | Reason: Interface eth1 is down",
+		"clish[2345]: cmd by admin: Start executing : set hostname gw1 (cmd md5: abc123)",
 	} {
 		f.Add(s)
 	}

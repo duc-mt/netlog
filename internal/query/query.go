@@ -94,6 +94,31 @@ func LoadTail(dataDir string, f Filter, tailBytes int64) ([]collector.LogEntry, 
 	return load(dataDir, f, tailBytes)
 }
 
+// Scan streams the entries under dataDir that match f to fn, one at a time,
+// without keeping them. Memory stays flat however much history is read, which
+// is what an aggregating caller (netlog report) needs; Load, which collects
+// and sorts every match, scales with the amount of data instead.
+//
+// Entries arrive in file (day) order and, within a day, in the order they were
+// stored: not sorted by time, so a caller that needs order must sort what it
+// keeps. A data directory with no logs yields no calls and no error.
+func Scan(dataDir string, f Filter, fn func(collector.LogEntry)) error {
+	files, err := logFiles(store.LogsDir(dataDir), f.Since, f.Until)
+	if err != nil {
+		return err
+	}
+	for _, path := range files {
+		if err := scanFile(path, 0, func(e collector.LogEntry) {
+			if f.Match(e) {
+				fn(e)
+			}
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func load(dataDir string, f Filter, tailBytes int64) ([]collector.LogEntry, error) {
 	dir := store.LogsDir(dataDir)
 

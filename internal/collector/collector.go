@@ -93,6 +93,14 @@ type LogEntry struct {
 	Event   string `json:"event"`
 	Summary string `json:"summary"`
 	Raw     string `json:"raw"`
+
+	// Object is what a state-change event is about: the interface of a
+	// LINK_DOWN/LINK_UP, the neighbor or peer address of an OSPF/BGP event.
+	// The classifier sets it so a later "up" can be paired with the matching
+	// "down" (outage durations) without every consumer re-parsing Raw. Empty
+	// for other events, for entries stored before the field existed, and
+	// whenever the line does not name the object.
+	Object string `json:"object,omitempty"`
 }
 
 // IncidentReport is the auto-triage output: the log line that triggered the
@@ -164,9 +172,17 @@ var logPlans = map[string]fetchPlan{
 	"aruba":         {Commands: []string{"show logging"}},
 	"ruijie":        {Commands: []string{"show logging"}},
 	"mikrotik":      {Commands: []string{"/log print"}},
-	"arista":        {Commands: []string{"show logging last 100 lines"}},
-	"paloalto":      {Commands: []string{"show log system"}},
-	"generic":       {Commands: []string{"show logging"}},
+
+	// pfSense 2.5+ and Check Point Gaia keep plain-text syslog files. They
+	// are read with tail over an exec channel, which needs a login that is
+	// allowed a shell (pfSense: admin or a user with shell access; Gaia: a
+	// user whose shell is /bin/bash, not clish). The pfSense command reads
+	// both the system and the authentication log (-q: no file headers).
+	"pfsense":         {Commands: []string{"tail -q -n 300 /var/log/system.log /var/log/auth.log"}},
+	"checkpoint_gaia": {Commands: []string{"tail -n 300 /var/log/messages"}},
+	"arista":          {Commands: []string{"show logging last 100 lines"}},
+	"paloalto":        {Commands: []string{"show log system"}},
+	"generic":         {Commands: []string{"show logging"}},
 }
 
 // defaultClockCommand is used for any vendor without an explicit entry in
@@ -177,17 +193,18 @@ const defaultClockCommand = "show clock"
 // clockCommands maps a canonical vendor key to the command that prints the
 // device's current time.
 var clockCommands = map[string]string{
-	"cisco_ios":     "show clock",
-	"arista":        "show clock",
-	"aruba":         "show clock",
-	"ruijie":        "show clock",
-	"huawei_vrp":    "display clock",
-	"vyos":          "date",
-	"pfsense":       "date",
-	"juniper_junos": "show system uptime",
-	"mikrotik":      "/system clock print",
-	"fortigate":     "get system time",
-	"generic":       "show clock",
+	"cisco_ios":       "show clock",
+	"arista":          "show clock",
+	"aruba":           "show clock",
+	"ruijie":          "show clock",
+	"huawei_vrp":      "display clock",
+	"vyos":            "date",
+	"pfsense":         "date",
+	"checkpoint_gaia": "date",
+	"juniper_junos":   "show system uptime",
+	"mikrotik":        "/system clock print",
+	"fortigate":       "get system time",
+	"generic":         "show clock",
 }
 
 // clockCommandFor returns the clock command for a canonical vendor key.

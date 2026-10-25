@@ -445,3 +445,67 @@ func TestLoadTailReadsOnlyTheEnd(t *testing.T) {
 		t.Errorf("a tail larger than the file reads everything, got %d", len(all))
 	}
 }
+
+// Scan must yield exactly what Load returns (same filter, same tolerance for a
+// truncated last line), minus the sorting and the accumulation.
+func TestScanMatchesLoad(t *testing.T) {
+	dir, now := seed(t)
+	for name, f := range map[string]Filter{
+		"everything":    {},
+		"since 24h":     {Since: now.Add(-24 * time.Hour)},
+		"bounded":       {Since: now.Add(-48 * time.Hour), Until: now.Add(-30 * time.Minute)},
+		"category":      {Category: "CONFIG"},
+		"host + window": {Host: "ho-gw", Since: now.Add(-48 * time.Hour)},
+		"nothing":       {Host: "no-such-device"},
+	} {
+		want, err := Load(dir, f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got []collector.LogEntry
+		if err := Scan(dir, f, func(e collector.LogEntry) { got = append(got, e) }); err != nil {
+			t.Fatal(err)
+		}
+		ids := func(es []collector.LogEntry) map[string]bool {
+			m := map[string]bool{}
+			for _, e := range es {
+				m[e.ID] = true
+			}
+			return m
+		}
+		if len(got) != len(want) {
+			t.Errorf("%s: Scan yielded %d entries, Load %d", name, len(got), len(want))
+			continue
+		}
+		g, w := ids(got), ids(want)
+		for id := range w {
+			if !g[id] {
+				t.Errorf("%s: Scan is missing entry %s", name, id)
+			}
+		}
+	}
+}
+
+func TestScanOrderAndEmpty(t *testing.T) {
+	dir, _ := seed(t)
+	var days []string
+	if err := Scan(dir, Filter{}, func(e collector.LogEntry) { days = append(days, e.Timestamp.Format("2006-01-02")) }); err != nil {
+		t.Fatal(err)
+	}
+	// Day files are walked in date order; within a day the stored order is kept.
+	for i := 1; i < len(days); i++ {
+		if days[i] < days[i-1] {
+			t.Errorf("days out of order: %v", days)
+		}
+	}
+
+	calls := 0
+	for _, d := range []string{t.TempDir(), "/nonexistent/netlog-data"} {
+		if err := Scan(d, Filter{}, func(collector.LogEntry) { calls++ }); err != nil {
+			t.Errorf("a data directory with no logs is not an error: %v", err)
+		}
+	}
+	if calls != 0 {
+		t.Errorf("empty data directories produced %d entries", calls)
+	}
+}

@@ -39,11 +39,12 @@ import (
 const DefaultCooldown = 5 * time.Minute
 
 var cooldowns = map[string]time.Duration{
-	"LINK_DOWN":           10 * time.Minute,
-	"LINK_FLAP":           10 * time.Minute,
-	"OSPF_ADJ_DOWN":       5 * time.Minute,
-	"BGP_PEER_DOWN":       5 * time.Minute,
-	"BRUTE_FORCE_ATTEMPT": 15 * time.Minute,
+	"LINK_DOWN":              10 * time.Minute,
+	"LINK_FLAP":              10 * time.Minute,
+	"OSPF_ADJ_DOWN":          5 * time.Minute,
+	"BGP_PEER_DOWN":          5 * time.Minute,
+	"BRUTE_FORCE_ATTEMPT":    15 * time.Minute,
+	"PASSWORD_SPRAY_ATTEMPT": 15 * time.Minute,
 }
 
 // CooldownFor returns the cooldown period for an event type.

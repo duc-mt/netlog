@@ -521,7 +521,9 @@ func TestExtractInterfaceAndPeer(t *testing.T) {
 		"%ADJCHG: Nbr 10.0.0.2 on eth1:10.0.0.1: Full -> Down (InactivityTimer)":                                        "eth1",
 		"%OSPF-5-ADJCHG: Process 1, Nbr 10.1.1.2 on Gi0/1 from FULL to DOWN, Neighbor Down: Interface down or detached": "Gi0/1",
 		"Neighbor Down: Interface down or detached":                                                                     "",
-		"nothing relevant here": "",
+		"kernel: igb0: link state changed to DOWN":                                                                      "igb0",
+		"kernel: vtnet1: link state changed to UP":                                                                      "vtnet1",
+		"nothing relevant here":                                                                                         "",
 	}
 	for raw, want := range ifaces {
 		if got := ExtractInterface(raw); got != want {
