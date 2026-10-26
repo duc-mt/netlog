@@ -49,6 +49,7 @@ import (
 	"netlog/internal/collector"
 	"netlog/internal/credentials"
 	"netlog/internal/inventory"
+	"netlog/internal/notifier"
 	"netlog/internal/parser"
 	"netlog/internal/pipeline"
 	"netlog/internal/query"
@@ -94,6 +95,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return cmdReport(args[1:], stdout, stderr)
 	case "status":
 		return cmdStatus(args[1:], stdout, stderr)
+	case "telegram-test":
+		return cmdTelegramTest(args[1:], stdout, stderr)
 	case "version", "-version", "--version":
 		fmt.Fprintln(stdout, "netlog", version)
 		return exitOK
@@ -119,6 +122,7 @@ Usage:
   netlog incidents [flags]   list auto-triage reports, or show one with --id
   netlog report    [flags]   rankings and trends: noisy devices, changes, watchlist
   netlog status    [flags]   per-device collection health: failing, stale, silent
+  netlog telegram-test [flags] send a test notification to verified Telegram configuration
   netlog version
 
 Run "netlog <command> -h" for a command's flags.
@@ -363,6 +367,7 @@ type app struct {
 	detector   *pipeline.Detector
 	writer     *store.JSONLWriter
 	engine     *triage.Engine
+	telegram   *notifier.TelegramNotifier
 
 	loc *time.Location
 
@@ -458,6 +463,11 @@ func newApp(o collectOpts, log *stderrLogger) (*app, error) {
 		Logger:          log,
 	})
 
+	tg := notifier.NewTelegram(notifier.ConfigFromStore(creds), log)
+	if tg != nil {
+		log.Info("telegram alerts enabled (chat_id: %s)", creds.Get("TELEGRAM_CHAT_ID"))
+	}
+
 	engine, err := triage.New(triage.Config{
 		DataDir:         o.dataDir,
 		SSH:             sshOpts,
@@ -465,8 +475,12 @@ func newApp(o collectOpts, log *stderrLogger) (*app, error) {
 		JumpEnabled:     o.jumpEnabled,
 		JumpDefaultHost: o.jumpHost,
 		Logger:          log,
+		Hook:            tg,
 	})
 	if err != nil {
+		if tg != nil {
+			tg.Close()
+		}
 		_ = writer.Close()
 		release()
 		return nil, err
@@ -494,10 +508,11 @@ func newApp(o collectOpts, log *stderrLogger) (*app, error) {
 			AfterHoursStart: o.afterHoursStart,
 			AfterHoursEnd:   o.afterHoursEnd,
 		}),
-		detector: det,
-		writer:   writer,
-		engine:   engine,
-		loc:      time.Local,
+		detector:   det,
+		writer:     writer,
+		engine:     engine,
+		telegram:   tg,
+		loc:        time.Local,
 		warnedAt: make(map[string]time.Time),
 		failing:  make(map[string]string),
 		unlock:   release,
@@ -529,6 +544,9 @@ func hostKeyCallback(o collectOpts, log *stderrLogger) (ssh.HostKeyCallback, err
 }
 
 func (a *app) close() {
+	if a.telegram != nil {
+		a.telegram.Close()
+	}
 	a.engine.Close()
 	if err := a.marks.Save(); err != nil {
 		a.log.Warn("saving watermarks: %v", err)
@@ -629,6 +647,9 @@ func (a *app) process(ctx context.Context, r collector.Result, st *cycleStats) {
 				a.log.Warn("%s: %v (device skipped)", host, r.Err)
 			} else {
 				a.log.Warn("%s: poll failed: %v", host, r.Err)
+				if a.telegram != nil {
+					a.telegram.SendDeviceHealth(host, false, msg)
+				}
 			}
 		}
 		return
@@ -638,6 +659,9 @@ func (a *app) process(ctx context.Context, r collector.Result, st *cycleStats) {
 	if _, was := a.failing[host]; was {
 		delete(a.failing, host)
 		a.log.Info("%s: poll recovered", host)
+		if a.telegram != nil {
+			a.telegram.SendDeviceHealth(host, true, "")
+		}
 	}
 
 	// Stage 2 (parse). Stage 1 (watermark) needs entries to compare, so
@@ -1095,5 +1119,57 @@ func cmdStatus(args []string, stdout, stderr io.Writer) int {
 			}
 		}
 	}
+	return exitOK
+}
+
+// ==============================================================================
+// telegram-test
+// ==============================================================================
+
+func cmdTelegramTest(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("telegram-test", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	envFile := fs.String("env-file", ".env", "path to .env file")
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+
+	creds, err := credentials.NewStore(*envFile)
+	if err != nil {
+		fmt.Fprintf(stderr, "netlog telegram-test: error loading credentials from %s: %v\n", *envFile, err)
+		return exitError
+	}
+
+	cfg := notifier.ConfigFromStore(creds)
+	if !cfg.Enabled {
+		fmt.Fprintf(stderr, "netlog telegram-test: TELEGRAM_ENABLED is not set to true in environment or %s\n", *envFile)
+		return exitError
+	}
+	if cfg.BotToken == "" || cfg.ChatID == "" {
+		fmt.Fprintf(stderr, "netlog telegram-test: TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set\n")
+		return exitError
+	}
+
+	log := &stderrLogger{w: stderr}
+	tn := notifier.NewTelegram(cfg, log)
+	if tn == nil {
+		fmt.Fprintf(stderr, "netlog telegram-test: failed to initialize Telegram notifier\n")
+		return exitError
+	}
+	defer tn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	testMsg := fmt.Sprintf("🔔 <b>[NETLOG TEST] Telegram Alert Verification</b>\n\n• <b>Source:</b> <code>netlog</code>\n• <b>Timestamp:</b> %s\n• <b>Status:</b> Telegram notifier initialized successfully!\n• <b>Chat ID:</b> <code>%s</code>",
+		time.Now().Format("2006-01-02 15:04:05 MST"), cfg.ChatID)
+
+	fmt.Fprintf(stdout, "Sending test notification to Telegram chat %s...\n", cfg.ChatID)
+	if err := tn.SendSync(ctx, testMsg); err != nil {
+		fmt.Fprintf(stderr, "netlog telegram-test: FAILED: %v\n", err)
+		return exitError
+	}
+
+	fmt.Fprintln(stdout, "SUCCESS: Test notification delivered to Telegram.")
 	return exitOK
 }

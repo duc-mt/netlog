@@ -52,6 +52,13 @@ NETLOG_PASSWORD=change-me
 # NETLOG_JUMP_BASTION_DC_USERNAME=svc-dc-jump
 # NETLOG_JUMP_BASTION_DC_PASSWORD=dc-jump-pass
 # NETLOG_JUMP_BASTION_DC_KEY_FILE=/home/netops/.ssh/dc_jump_key
+
+# Optional Telegram Alert Notifications:
+# TELEGRAM_ENABLED=false
+# TELEGRAM_BOT_TOKEN="000000000:AAFg-XXXXXXXXXXXXXXXXXXXXXXXXXX"
+# TELEGRAM_CHAT_ID="-1001234567890"
+# TELEGRAM_MESSAGE_THREAD_ID=""
+# TELEGRAM_COOLDOWN_SECONDS=300
 `
 
 const sampleInventory = `hostname,address,port,vendor,credential_group,jump_host
