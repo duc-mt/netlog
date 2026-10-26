@@ -1065,3 +1065,36 @@ func TestOutagesEndToEnd(t *testing.T) {
 		}
 	}
 }
+
+func TestFindDevice(t *testing.T) {
+	devs := []inventory.Device{
+		{Hostname: "core-gw-1", Address: "10.0.0.1"},
+		{Hostname: "core-gw-2", Address: "10.0.0.2"},
+		{Hostname: "edge-1", Address: "10.0.1.1"},
+	}
+	if d, err := findDevice(devs, "CORE-GW-2"); err != nil || d.Address != "10.0.0.2" {
+		t.Errorf("exact (case-insensitive): %v %v", d, err)
+	}
+	if d, err := findDevice(devs, "10.0.1.1"); err != nil || d.Hostname != "edge-1" {
+		t.Errorf("by address: %v %v", d, err)
+	}
+	if d, err := findDevice(devs, "edge"); err != nil || d.Hostname != "edge-1" {
+		t.Errorf("unique prefix: %v %v", d, err)
+	}
+	if _, err := findDevice(devs, "core"); err == nil {
+		t.Error("ambiguous prefix should fail")
+	}
+	if _, err := findDevice(devs, "nope"); err == nil {
+		t.Error("unknown device should fail")
+	}
+}
+
+func TestDiagnoseUsage(t *testing.T) {
+	var out, errb bytes.Buffer
+	if code := run([]string{"diagnose"}, &out, &errb); code != exitUsage {
+		t.Errorf("no device: code %d, want %d", code, exitUsage)
+	}
+	if code := run([]string{"diagnose", "--interface", "Gi0/1;x", "r1"}, &out, &errb); code != exitUsage {
+		t.Errorf("bad interface: code %d, want %d", code, exitUsage)
+	}
+}

@@ -43,6 +43,10 @@ const (
 	famCisco   = "cisco"
 	famHuawei  = "huawei_vrp"
 	famJunos   = "juniper_junos"
+	famArista  = "arista"
+	famRuijie  = "ruijie"
+	famAruba   = "aruba"
+	famForti   = "fortigate"
 	famGeneric = "generic"
 )
 
@@ -57,7 +61,15 @@ func family(vendorKey string) string {
 		return famHuawei
 	case "juniper_junos":
 		return famJunos
-	case "generic", "aruba", "ruijie", "arista":
+	case "arista":
+		return famArista
+	case "ruijie":
+		return famRuijie
+	case "aruba":
+		return famAruba
+	case "fortigate":
+		return famForti
+	case "generic":
 		return famGeneric
 	}
 	return ""
@@ -70,28 +82,70 @@ var linkSteps = map[string][]step{
 	},
 	famCisco: {
 		{"show interfaces {iface}", "show ip interface brief"},
-		{"show interfaces {iface} transceiver", ""},
+		{"show interfaces {iface} transceiver detail", ""},
+		{"show interfaces {iface} counters errors", ""},
 	},
 	famHuawei: {
 		{"display interface {iface}", "display interface brief"},
+		{"display transceiver diagnosis interface {iface}", ""},
+	},
+	famJunos: {
+		{"show interfaces {iface} extensive", "show interfaces terse"},
+		{"show interfaces diagnostics optics {iface}", ""},
+	},
+	famArista: {
+		{"show interfaces {iface}", "show interfaces status"},
+		{"show interfaces {iface} transceiver", ""},
+		{"show interfaces {iface} counters errors", ""},
+	},
+	famRuijie: {
+		{"show interfaces {iface}", "show interfaces status"},
+		{"show interfaces {iface} transceiver", ""},
+	},
+	famAruba: {
+		{"show interface {iface}", "show interface brief"},
+		{"show interface {iface} transceiver", ""},
+	},
+	famForti: {
+		{"get hardware nic {iface}", "get system interface physical"},
 	},
 	famGeneric: {
 		{"show interfaces {iface}", "show interfaces"},
 	},
 }
 
+// opticsSteps run on a transceiver / DDM alarm: optical Rx/Tx power first,
+// then the error counters that usually accompany a dirty or failing fibre.
+var opticsSteps = map[string][]step{
+	famCisco:  {{"show interfaces {iface} transceiver detail", "show interfaces transceiver detail"}, {"show interfaces {iface} counters errors", ""}},
+	famHuawei: {{"display transceiver diagnosis interface {iface}", "display transceiver alarm interface"}, {"display interface {iface}", ""}},
+	famJunos:  {{"show interfaces diagnostics optics {iface}", ""}, {"show interfaces {iface} extensive", ""}},
+	famArista: {{"show interfaces {iface} transceiver", "show interfaces transceiver"}, {"show interfaces {iface} counters errors", ""}},
+	famRuijie: {{"show interfaces {iface} transceiver", "show interfaces transceiver"}},
+	famAruba:  {{"show interface {iface} transceiver", "show interface transceiver"}},
+	famVyOS:   {{"show interfaces {vyif} physical", ""}},
+}
+
 var ospfSteps = map[string][]step{
 	famVyOS:   {{"show ip ospf neighbor", ""}, {"show ip ospf interface {iface}", "show ip ospf interface"}},
 	famCisco:  {{"show ip ospf neighbor", ""}, {"show ip ospf interface {iface}", "show ip ospf interface"}},
 	famHuawei: {{"display ospf peer", ""}, {"display ospf interface", ""}},
-	famJunos:  {{"show ospf neighbor", ""}},
+	famJunos:  {{"show ospf neighbor", ""}, {"show ospf interface", ""}},
+	famArista: {{"show ip ospf neighbor", ""}, {"show ip ospf interface {iface}", "show ip ospf interface"}},
+	famRuijie: {{"show ip ospf neighbor", ""}, {"show ip ospf interface {iface}", "show ip ospf interface"}},
+	famAruba:  {{"show ip ospf neighbor", ""}, {"show ip ospf interface {iface}", "show ip ospf interface"}},
+	famForti:  {{"get router info ospf neighbor", ""}, {"get router info ospf interface", ""}},
 }
 
 var bgpSteps = map[string][]step{
 	famVyOS:   {{"show ip bgp summary", ""}, {"show ip bgp neighbors {peer}", ""}},
 	famCisco:  {{"show ip bgp summary", ""}, {"show ip bgp neighbors {peer}", ""}},
 	famHuawei: {{"display bgp peer", ""}},
-	famJunos:  {{"show bgp summary", ""}},
+	famJunos:  {{"show bgp summary", ""}, {"show bgp neighbor {peer}", ""}},
+	famArista: {{"show ip bgp summary", ""}, {"show ip bgp neighbors {peer}", ""}},
+	famRuijie: {{"show ip bgp summary", ""}, {"show ip bgp neighbors {peer}", ""}},
+	famAruba:  {{"show bgp summary", ""}, {"show bgp neighbor {peer}", ""}},
+	famForti:  {{"get router info bgp summary", ""}, {"get router info bgp neighbors {peer}", ""}},
 }
 
 var usersSteps = map[string][]step{
@@ -117,7 +171,8 @@ var playbooks = map[string]map[string][]step{
 		famHuawei: {{"display cpu-usage", ""}},
 		famVyOS:   {{"show system processes", ""}},
 	},
-	pipeline.PlaybookBruteForce: usersSteps,
+	pipeline.PlaybookOpticsAlarm: opticsSteps,
+	pipeline.PlaybookBruteForce:  usersSteps,
 }
 
 // vyosTypes maps interface name prefixes to the VyOS interface type keyword

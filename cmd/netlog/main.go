@@ -48,6 +48,7 @@ import (
 
 	"netlog/internal/collector"
 	"netlog/internal/credentials"
+	"netlog/internal/diagnose"
 	"netlog/internal/inventory"
 	"netlog/internal/notifier"
 	"netlog/internal/parser"
@@ -97,6 +98,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return cmdStatus(args[1:], stdout, stderr)
 	case "telegram-test":
 		return cmdTelegramTest(args[1:], stdout, stderr)
+	case "diagnose":
+		return cmdDiagnose(args[1:], stdout, stderr)
 	case "version", "-version", "--version":
 		fmt.Fprintln(stdout, "netlog", version)
 		return exitOK
@@ -122,6 +125,7 @@ Usage:
   netlog incidents [flags]   list auto-triage reports, or show one with --id
   netlog report    [flags]   rankings and trends: noisy devices, changes, watchlist
   netlog status    [flags]   per-device collection health: failing, stale, silent
+  netlog diagnose  <device> [flags]  one-shot health check: SSH, alarms, BGP/OSPF, CRC errors, optical DDM
   netlog telegram-test [flags] send a test notification to verified Telegram configuration
   netlog version
 
@@ -131,6 +135,7 @@ Examples:
   netlog collect --dry-run                                        test connectivity and clock skew
   netlog collect --inventory inventory.csv --env-file .env --data-dir data
   netlog monitor --interval 2m --data-dir data
+  netlog diagnose core-gw-1 --raw                                 quick triage of one device
   netlog query --category CONFIG --since 24h
   netlog query --severity CRITICAL --since today --format json
   netlog timeline --from "2026-10-20 10:10:00" --to "2026-10-20 10:25:00"
@@ -508,11 +513,11 @@ func newApp(o collectOpts, log *stderrLogger) (*app, error) {
 			AfterHoursStart: o.afterHoursStart,
 			AfterHoursEnd:   o.afterHoursEnd,
 		}),
-		detector:   det,
-		writer:     writer,
-		engine:     engine,
-		telegram:   tg,
-		loc:        time.Local,
+		detector: det,
+		writer:   writer,
+		engine:   engine,
+		telegram: tg,
+		loc:      time.Local,
 		warnedAt: make(map[string]time.Time),
 		failing:  make(map[string]string),
 		unlock:   release,
@@ -1171,5 +1176,144 @@ func cmdTelegramTest(args []string, stdout, stderr io.Writer) int {
 	}
 
 	fmt.Fprintln(stdout, "SUCCESS: Test notification delivered to Telegram.")
+	return exitOK
+}
+
+// ==============================================================================
+// diagnose
+// ==============================================================================
+
+// findDevice resolves name against the inventory: exact hostname or address
+// (case-insensitive) first, then a unique hostname prefix.
+func findDevice(devices []inventory.Device, name string) (inventory.Device, error) {
+	var prefix []inventory.Device
+	for _, d := range devices {
+		if strings.EqualFold(d.Hostname, name) || d.Address == name {
+			return d, nil
+		}
+		if strings.HasPrefix(strings.ToLower(d.Hostname), strings.ToLower(name)) {
+			prefix = append(prefix, d)
+		}
+	}
+	switch len(prefix) {
+	case 1:
+		return prefix[0], nil
+	case 0:
+		return inventory.Device{}, fmt.Errorf("device %q not found in inventory", name)
+	}
+	names := make([]string, len(prefix))
+	for i, d := range prefix {
+		names[i] = d.Hostname
+	}
+	return inventory.Device{}, fmt.Errorf("device %q is ambiguous: %s", name, strings.Join(names, ", "))
+}
+
+func cmdDiagnose(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("netlog diagnose", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	fs.Usage = func() {
+		fmt.Fprintln(stderr, "Usage: netlog diagnose [flags] <device-name>")
+		fs.PrintDefaults()
+	}
+	var o collectOpts
+	var (
+		iface   = fs.String("interface", "", "limit the CRC and optical checks to one interface")
+		raw     = fs.Bool("raw", false, "print the verbatim device output under each check")
+		failBad = fs.Bool("fail", false, "exit 1 when the device is unreachable or any check needs attention")
+	)
+	fs.StringVar(&o.inventory, "inventory", "inventory.csv", "path to the device inventory CSV")
+	fs.StringVar(&o.envFile, "env-file", ".env", "path to an optional .env file with NETLOG_USERNAME / NETLOG_PASSWORD")
+	fs.DurationVar(&o.connectTimeout, "connect-timeout", 5*time.Second, "SSH dial timeout")
+	fs.DurationVar(&o.commandTimeout, "command-timeout", 5*time.Second, "SSH command timeout")
+	fs.StringVar(&o.knownHosts, "known-hosts", "known_hosts", "path to the known_hosts file (\"\" = the user's ~/.ssh/known_hosts)")
+	fs.StringVar(&o.knownHostsPolicy, "known-hosts-policy", "accept-new", "host key policy: strict, accept-new or update")
+	fs.BoolVar(&o.insecureIgnoreHostKey, "insecure-ignore-host-key", false, "DANGEROUS: skip host key verification entirely")
+	fs.BoolVar(&o.legacyAlgorithms, "legacy-algorithms", true, "allow legacy SSH algorithms as a fallback for older network gear")
+	fs.BoolVar(&o.jumpEnabled, "jump", true, "enable jump host / bastion routing")
+	fs.StringVar(&o.jumpHost, "jump-host", "", "global default bastion host[:port]")
+	fs.BoolVar(&o.noColor, "no-color", false, "disable coloured output")
+
+	// The device name may come before or after the flags.
+	var names []string
+	rest := args
+	for {
+		if err := fs.Parse(rest); err != nil {
+			if errors.Is(err, flag.ErrHelp) {
+				return exitOK
+			}
+			return exitUsage
+		}
+		if fs.NArg() == 0 {
+			break
+		}
+		names = append(names, fs.Arg(0))
+		rest = fs.Args()[1:]
+	}
+	if len(names) != 1 {
+		fmt.Fprintln(stderr, "netlog diagnose: exactly one <device-name> is required")
+		return exitUsage
+	}
+	if *iface != "" && !diagnose.ValidInterface(*iface) {
+		fmt.Fprintf(stderr, "netlog diagnose: invalid --interface %q\n", *iface)
+		return exitUsage
+	}
+
+	devices, warns := inventory.Load(o.inventory)
+	if len(devices) == 0 {
+		for _, w := range warns {
+			fmt.Fprintf(stderr, "netlog diagnose: inventory: %v\n", w)
+		}
+		fmt.Fprintf(stderr, "netlog diagnose: inventory %q contains no devices (tip: run 'netlog init')\n", o.inventory)
+		return exitError
+	}
+	dev, err := findDevice(devices, names[0])
+	if err != nil {
+		fmt.Fprintf(stderr, "netlog diagnose: %v\n", err)
+		return exitError
+	}
+
+	log := &stderrLogger{w: stderr}
+	if o.jumpHost != "" {
+		os.Setenv(credentials.EnvJumpHost, o.jumpHost)
+	}
+	creds, err := credentials.NewStore(o.envFile)
+	if err != nil {
+		fmt.Fprintf(stderr, "netlog diagnose: loading credentials: %v\n", err)
+		return exitError
+	}
+	hostKeys, err := hostKeyCallback(o, log)
+	if err != nil {
+		fmt.Fprintf(stderr, "netlog diagnose: %v\n", err)
+		return exitError
+	}
+	sshOpts := sshclient.Options{
+		ConnectTimeout:   o.connectTimeout,
+		CommandTimeout:   o.commandTimeout,
+		HostKeyCallback:  hostKeys,
+		LegacyAlgorithms: o.legacyAlgorithms,
+	}
+	if sshOpts.ConnectTimeout <= 0 || sshOpts.ConnectTimeout > triage.MaxConnectTimeout {
+		sshOpts.ConnectTimeout = triage.MaxConnectTimeout
+	}
+	dialer := collector.NewDialer(collector.DialerConfig{
+		SSH:             sshOpts,
+		CredStore:       creds,
+		JumpEnabled:     o.jumpEnabled,
+		JumpDefaultHost: o.jumpHost,
+	})
+	defer dialer.CloseJumps()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	rep := diagnose.Run(ctx, dialer, dev, diagnose.Options{
+		Interface:      *iface,
+		CommandTimeout: o.commandTimeout,
+		SSH:            sshOpts,
+	})
+	diagnose.Render(stdout, rep, diagnose.RenderOptions{Color: colorEnabled(stdout, o.noColor), Raw: *raw})
+	if *failBad && !rep.Healthy() {
+		return exitError
+	}
 	return exitOK
 }

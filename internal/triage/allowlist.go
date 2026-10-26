@@ -16,7 +16,8 @@
 // A command passes only if ALL of the following hold:
 //
 //  1. It starts with one of: "show ", "display ", "/log print",
-//     "cat /proc/net/", "execute log display" (case-sensitive).
+//     "cat /proc/net/", "execute log display", "get " (FortiOS read-only
+//     status commands) (case-sensitive).
 //  2. It contains none of the destructive words: conf, set, delete, clear,
 //     write, reload, restart, copy, format, "debug ip packet" (case-
 //     insensitive substring, deliberately blunt: "show running-config" and
@@ -42,7 +43,7 @@ import (
 const maxCommandLen = 200
 
 var (
-	allowedPrefix = regexp.MustCompile(`^(show |display |/log print|cat /proc/net/|execute log display)`)
+	allowedPrefix = regexp.MustCompile(`^(show |display |get |/log print|cat /proc/net/|execute log display)`)
 
 	// Anything that could chain, redirect, substitute or break out of the line.
 	metaChars = regexp.MustCompile("[;&`$<>\\\\!{}\\x00-\\x1f\\x7f]")

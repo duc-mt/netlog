@@ -54,6 +54,7 @@ const (
 	EventVRRPTransition   = "VRRP_TRANSITION"
 	EventSTPTCN           = "STP_TCN"
 	EventHighCPU          = "HIGH_CPU"
+	EventOpticsAlarm      = "OPTICS_ALARM"
 	EventCLICommand       = "CLI_COMMAND"
 	EventUnknown          = "UNKNOWN"
 
@@ -103,10 +104,10 @@ var rules = []rule{
 	mk(`authentication (?:failure|failed|error)|failed password|bad auth|login[ _]fail(?:ed|ure)|failed login|failed to log ?in|invalid user`,
 		collector.CategoryAuth, EventLoginFailure, collector.SeverityWarning),
 
-	mk(`ospf.*adjchg.*down|ospf.*neighbor.*down`,
+	mk(`ospf.*adjchg.*down|ospf.*neighbor.*down|ospf.*nbr_chg.*down|ospf.*nbr.*(?:to|->)\\s*down\\b|rpd_ospf_nbrdown`,
 		collector.CategoryFault, EventOSPFAdjDown, collector.SeverityError),
 
-	mk(`bgp.*adjchange.*down|bgp.*peer.*down|bgp.*from established`,
+	mk(`bgp.*adjchange.*down|bgp.*peer.*down|bgp.*from established|rpd_bgp_neighbor_state_changed.*(?:idle|active|connect)|bgp.*backward.?transition|bgp.*notification.*sent`,
 		collector.CategoryFault, EventBGPPeerDown, collector.SeverityError),
 
 	mk(`vrrp.*backup|vrrp.*master.*lost`,
@@ -121,6 +122,11 @@ var rules = []rule{
 	// flags a state change, not which node is now active.
 	mk(`subtype="?ha\b"?|clus-\d+.*state change|\bfailover\b|switching to (?:active|standby)|\bha[ _](?:state|role)`,
 		collector.CategoryFault, EventHAChange, collector.SeverityWarning),
+
+	// Optical transceiver / DDM alarms. Placed before the hardware rule so
+	// "temperature high" on a transceiver is filed as optics, not chassis.
+	mk(`(?:transceiver|optical|\\bsfp\\b|\\bqsfp|\\bddm\\b|\\brx power|\\btx power|\\blos\\b|loss of signal).*(?:alarm|warning|threshold|low|high|loss|fail|fault|absent|los\\b)|(?:rx|tx)[ _-]?power.*(?:low|high|alarm|warn)`,
+		collector.CategoryFault, EventOpticsAlarm, collector.SeverityWarning),
 
 	mk(`(?:power[ -]?supply|\bpsu\b|\bfans?\b|temperature|thermal|over-?heat).*(?:fail|fault|down|alarm|critical|exceed|too high|high|removed|stopp|shut ?down)`,
 		collector.CategoryFault, EventHardwareFault, collector.SeverityError),

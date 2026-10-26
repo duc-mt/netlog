@@ -112,6 +112,21 @@ core-1   OK            2026-10-24 18:59      -  2026-10-24 18:00
 `netlog status --fail` exits 1 when any device is not `OK`, for cron and monitoring.
 It also reads `inventory.csv` (`--inventory`) to find the devices never polled.
 
+## Quick triage: `diagnose`
+
+```
+./run diagnose core-gw-1 [--interface Gi0/1] [--raw] [--fail]
+```
+
+One read-only pass against a single device (hostname, address or unique hostname
+prefix from `inventory.csv`): SSH connect/auth latency, active alarms, BGP peers,
+OSPF neighbors, CRC/input errors and optical DDM power (Rx/Tx dBm). Each check shows
+`[OK]`, `[WARN]` or `[ERROR]`; `--raw` adds the device output and `--fail` exits 1
+when anything needs attention. Every command passes the same allowlist as auto-triage.
+Auto-triage playbooks also run transceiver DDM and error-counter commands on link
+down, plus a new `OPTICS_ALARM` playbook, for Cisco, Huawei, Junos, Arista, Ruijie,
+Aruba, VyOS and FortiGate (FortiOS read-only `get ...` commands are allowlisted).
+
 ## Configuration
 
 **`inventory.csv`**, one device per line (see `examples/inventory.csv`):

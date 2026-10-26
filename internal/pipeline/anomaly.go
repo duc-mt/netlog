@@ -55,6 +55,7 @@ const (
 	PlaybookVRRPTransition = "vrrp_transition"
 	PlaybookSTPTCN         = "stp_tcn"
 	PlaybookHighCPU        = "high_cpu"
+	PlaybookOpticsAlarm    = "optics_alarm"
 	PlaybookBruteForce     = "brute_force"
 )
 
@@ -311,6 +312,8 @@ func (d *Detector) observe(e collector.LogEntry) []TriageSignal {
 		return d.simple(st, e, fresh, PlaybookVRRPTransition, PriorityMedium)
 	case EventSTPTCN:
 		return d.simple(st, e, fresh, PlaybookSTPTCN, PriorityLow)
+	case EventOpticsAlarm:
+		return d.simple(st, e, fresh, PlaybookOpticsAlarm, PriorityMedium)
 	case EventHighCPU:
 		return d.simple(st, e, fresh, PlaybookHighCPU, PriorityMedium)
 	}

@@ -888,3 +888,23 @@ func TestSuppressOwn(t *testing.T) {
 		t.Error("fast path must return the original slice when nothing is suppressed")
 	}
 }
+
+func TestClassifierOpticsAndVendorRouting(t *testing.T) {
+	c := NewClassifier(time.UTC)
+	tests := []struct{ raw, event string }{
+		{"%SFF8472-5-THRESHOLD_VIOLATION: Gi1/0/1: Rx power low alarm; Operating value: -25.3 dBm", EventOpticsAlarm},
+		{"OPTMOD/4/MODULE_INFO: Optical module on interface 10GE1/0/1 Rx power is too low", EventOpticsAlarm},
+		{"transceiver loss of signal on Ethernet1", EventOpticsAlarm},
+		{"rpd[1234]: RPD_OSPF_NBRDOWN: OSPF neighbor 10.0.0.2 (ge-0/0/1.0) state changed from Full to Down", EventOSPFAdjDown},
+		{"rpd[1234]: RPD_BGP_NEIGHBOR_STATE_CHANGED: BGP peer 10.0.0.9 (External AS 65001) changed state from Established to Idle", EventBGPPeerDown},
+		{"%LINK-3-UPDOWN: Interface GigabitEthernet0/1, changed state to down", EventLinkDown},
+		{"Power supply 2 failed", EventHardwareFault},
+	}
+	for _, tc := range tests {
+		e := collector.LogEntry{Raw: tc.raw, Timestamp: time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)}
+		c.Classify(&e)
+		if e.Event != tc.event {
+			t.Errorf("%q: event %s, want %s", tc.raw, e.Event, tc.event)
+		}
+	}
+}
