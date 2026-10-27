@@ -37,3 +37,7 @@ coverage.html
 *.swp
 .DS_Store
 Thumbs.db
+
+# Deliverables
+deliverables/
+
