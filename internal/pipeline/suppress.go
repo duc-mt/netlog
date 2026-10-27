@@ -44,7 +44,8 @@ import (
 )
 
 // ownSessionPatterns match log lines that are produced solely by netlog's SSH
-// polling sessions (PAM, systemd session tracking, VyOS config-mount units).
+// polling sessions (PAM, systemd session tracking, VyOS config-mount units)
+// and periodic OS background housekeeping that carries no diagnostic value.
 // They are compiled once at package init.  All patterns are case-insensitive.
 var ownSessionPatterns = []*regexp.Regexp{
 	// PAM environment deprecation warning emitted on every SSH login.
@@ -56,14 +57,49 @@ var ownSessionPatterns = []*regexp.Regexp{
 	// systemd session scope lifecycle ("Started Session N of User X" / "Removed …").
 	regexp.MustCompile(`(?i)systemd\[1\]: (?:Started|Removed) Session \d+ of User`),
 
-	// systemd-logind session tracking ("New session N of user X" / "Removed …").
-	regexp.MustCompile(`(?i)systemd-logind\[\d+\]: (?:New|Removed) session \d+ of user`),
+	// systemd-logind session tracking ("New session N of user X" / "Removed session N").
+	regexp.MustCompile(`(?i)systemd-logind\[\d+\]: (?:New|Removed) session \d+(?: of user)?`),
+
+	// systemd-logind session logout notice.
+	regexp.MustCompile(`(?i)systemd-logind\[\d+\]: Session \d+ logged out\. Waiting for processes to exit`),
+
+	// systemd user manager lifecycle and runtime targets for automated SSH sessions.
+	regexp.MustCompile(`(?i)systemd\[\d+\]: (?:Starting|Started) User Manager for UID \d+`),
+	regexp.MustCompile(`(?i)systemd\[\d+\]: (?:Finished|Starting) User Runtime Directory /run/user/\d+`),
+	regexp.MustCompile(`(?i)systemd\[\d+\]: Created slice User Slice of UID \d+`),
+	regexp.MustCompile(`(?i)systemd\[\d+\]: (?:Reached target|Queued start job for default target)`),
+	regexp.MustCompile(`(?i)pam_unix\(systemd-user:session\): session opened for user`),
+
+	// SSH disconnect signal artifact after automated command execution.
+	regexp.MustCompile(`(?i)sshd\[\d+\]: error: session_signal_req: no pid for session`),
 
 	// systemd session-N.scope unit activation / deactivation.
 	regexp.MustCompile(`(?i)systemd\[1\]: session-\d+\.scope:`),
 
 	// VyOS temporary config-mount units created during "show log" retrieval.
 	regexp.MustCompile(`(?i)opt-vyatta-config-tmp-[^:]+\.mount:`),
+
+	// Periodic rsyslog heartbeat.
+	regexp.MustCompile(`(?i)rsyslogd\[\d+\]: -- MARK --`),
+
+	// Routine logrotate maintenance.
+	regexp.MustCompile(`(?i)systemd\[1\]: (?:Starting|Finished) Rotate log files`),
+	regexp.MustCompile(`(?i)systemd\[1\]: logrotate\.service: Deactivated successfully`),
+
+	// Routine hourly/daily cron maintenance.
+	regexp.MustCompile(`(?i)CRON\[\d+\]: pam_unix\(cron:session\): session (?:opened|closed) for user root`),
+	regexp.MustCompile(`(?i)CRON\[\d+\]: \(root\) CMD \(cd / && run-parts`),
+	regexp.MustCompile(`(?i)CRON\[\d+\]: \(CRON\) info \(No MTA installed`),
+	regexp.MustCompile(`(?i)CRON\[\d+\]: \(root\) CMD \(test -x /usr/sbin/anacron`),
+
+	// Kernel packet hex dumps and ratelimit notices.
+	regexp.MustCompile(`(?i)kernel: ll header: [0-9a-f]{8}:`),
+	regexp.MustCompile(`(?i)kernel: net_ratelimit: \d+ callbacks suppressed`),
+
+	// VyOS internal IPC debug messages.
+	regexp.MustCompile(`(?i)keepalived-fifo\.py\[\d+\]: (?:Received message|INSTANCE \S+ changed state to MASTER_RX_LOWER_PRI)`),
+	regexp.MustCompile(`(?i)vyos-configd\[\d+\]: (?:Received message: \{"type":|commit_scripts:|scripts_called:|config session pid is)`),
+	regexp.MustCompile(`(?i)watchfrr\[\d+\]: \[VTVCM-Y2NW3\] Configuration Read in Took:`),
 }
 
 // SuppressOwn returns a new slice that omits any entry whose Raw text matches

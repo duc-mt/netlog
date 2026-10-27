@@ -429,7 +429,7 @@ func guessFacility(prog, msg string) string {
 var (
 	reUserBracket = regexp.MustCompile(`(?i)\[user:\s*([^\]\s]+)\]`)
 	reSrcBracket  = regexp.MustCompile(`(?i)\[(?:source|src):\s*([0-9a-f:.]+)\]`)
-	reByOn        = regexp.MustCompile(`\bby\s+(\S+)\s+on\s+(\S+?)(?:\s+\(([0-9a-fA-F:.]+)\))?(?:\s|$)`)
+	reByOn        = regexp.MustCompile(`\bby\s+(?:user\s+)?(\S+)\s+on\s+(\S+?)(?:\s+\(([0-9a-fA-F:.]+)\))?(?:\s|$)`)
 	reSSHAuth     = regexp.MustCompile(`(?i)\b(?:accepted|failed)\s+\S+\s+for\s+(?:invalid user\s+)?(\S+)\s+from\s+([0-9a-f:.]+)`)
 	reQuotedUser  = regexp.MustCompile(`(?i)\buser\s+'([^']+)'`)
 	reKVUser      = regexp.MustCompile(`(?i)\b(?:user|username)="?([^\s,)"]+)`)
@@ -439,6 +439,7 @@ var (
 	reFromIP      = regexp.MustCompile(`(?i)\bfrom:?\s+(\d{1,3}(?:\.\d{1,3}){3})\b`)
 	reCfgUserAt   = regexp.MustCompile(`(?i)configuration chang(?:e|ed)[^:]*:\s*([^\s@:]+)@([0-9a-f:.]+)`)
 	reCmdBy       = regexp.MustCompile(`(?i)\bcmd by ([A-Za-z0-9_.@-]+):`)
+	reSudoUser    = regexp.MustCompile(`(?i)\b(?:config session )?sudo_user is ([A-Za-z0-9_.@-]+)`)
 )
 
 // validIP returns s if it parses as an IP address (after trimming trailing
@@ -543,6 +544,11 @@ func attribute(e *collector.LogEntry, msg string) {
 	}
 	if has("cmd by") { // Check Point Gaia clish: "cmd by admin: Start executing : set ..."
 		if m := reCmdBy.FindStringSubmatch(msg); m != nil {
+			setUser(m[1])
+		}
+	}
+	if has("sudo_user") { // VyOS vyos-configd: "config session sudo_user is langpx"
+		if m := reSudoUser.FindStringSubmatch(msg); m != nil {
 			setUser(m[1])
 		}
 	}

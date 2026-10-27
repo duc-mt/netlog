@@ -67,6 +67,11 @@ func TestClassifierRules(t *testing.T) {
 		{"cisco bgp", "cisco_ios", "Oct 20 09:31:02: %BGP-5-ADJCHANGE: neighbor 10.1.1.1 Down Peer closed the session", "FAULT", EventBGPPeerDown, "ERROR"},
 		{"junos bgp", "juniper_junos", "Oct 20 09:30:16  sw1 rpd[1]: RPD_BGP_NEIGHBOR_STATE_CHANGED: BGP peer 10.2.2.2 (External AS 65001) changed state from Established to Idle", "FAULT", EventBGPPeerDown, "ERROR"},
 		{"vrrp", "vyos", "Oct 20 09:44:05 R1 Keepalived_vrrp[9]: (VRRP1) Entering BACKUP STATE", "FAULT", EventVRRPTransition, "WARNING"},
+		{"vrrp fault", "vyos", "Oct 20 09:44:05 R1 Keepalived_vrrp[9]: Entering FAULT STATE", "FAULT", EventVRRPTransition, "WARNING"},
+		{"vrrp master", "vyos", "Oct 20 09:44:05 R1 Keepalived_vrrp[9]: Entering MASTER STATE", "SYSTEM", EventVRRPTransition, "INFO"},
+		{"vrrp lower pri advert", "vyos", "Oct 20 09:44:05 R1 Keepalived_vrrp[9]: (LAN) Received advert from 10.134.4.3 with lower priority 100, ours 150, forcing new election", "SYSTEM", EventHAChange, "INFO"},
+		{"vyos commit error", "vyos", "Oct 20 09:44:05 R1 vyos-configd[798]: Sending reply: ERROR_COMMIT with output", "CONFIG", EventConfigChange, "ERROR"},
+		{"vyos config write", "vyos", "Oct 20 09:44:05 R1 watchfrr[1402]: [WFP93-1D146] configuration write completed with exit code 0", "CONFIG", EventConfigChange, "WARNING"},
 		{"stp", "cisco_ios", "Oct 20 09:31:02: %SPANTREE-5-TOPOTRAP: Topology Change Trap for vlan 100", "FAULT", EventSTPTCN, "WARNING"},
 		{"cpu", "cisco_ios", "Oct 20 09:31:02: %SYS-3-CPUHOG: CPU utilization for five seconds: 97%/3%", "SYSTEM", EventHighCPU, "WARNING"},
 		{"unknown", "cisco_ios", "Oct 20 09:31:02: %SYS-6-LOGGINGHOST_STARTSTOP: Logging to host 10.0.0.9 port 514 started", "SYSTEM", EventUnknown, "INFO"},
@@ -830,6 +835,42 @@ func TestSuppressOwn(t *testing.T) {
 		"Oct 23 15:24:58 NHG-TRANSIT-GW-01 systemd[1]: opt-vyatta-config-tmp-new_config_283448.mount: Deactivated successfully.",
 		// uppercase variant (case-insensitive)
 		"Oct 23 15:24:58 NHG-TRANSIT-GW-01 systemd[1]: Session-1234.SCOPE: Activated successfully.",
+		// systemd-logind without "of user"
+		"Oct 27 15:57:00 NHG-VYOS systemd-logind[980]: Removed session 966.",
+		"Oct 27 15:57:00 NHG-VYOS systemd-logind[980]: Session 966 logged out. Waiting for processes to exit.",
+		// sshd signal error
+		"Oct 27 15:57:00 NHG-VYOS sshd[249974]: error: session_signal_req: no pid for session 0",
+		// user runtime manager
+		"Oct 27 15:41:14 NHG-VYOS systemd[1]: Starting User Manager for UID 1004...",
+		"Oct 27 15:41:14 NHG-VYOS systemd[1]: Started User Manager for UID 1004.",
+		"Oct 27 15:41:14 NHG-VYOS systemd[1]: Created slice User Slice of UID 1004.",
+		"Oct 27 15:41:14 NHG-VYOS systemd[1]: Finished User Runtime Directory /run/user/1004.",
+		"Oct 27 15:41:15 NHG-VYOS systemd[247600]: Reached target default.target - Main User Target.",
+		"Oct 27 15:41:15 NHG-VYOS systemd[247600]: Queued start job for default target default.target.",
+		"Oct 27 15:41:14 NHG-VYOS (systemd)[247600]: pam_unix(systemd-user:session): session opened for user sysadmin(uid=1004) by (uid=0)",
+		// rsyslog mark
+		"Oct 27 15:37:55 NHG-VYOS rsyslogd[8010]: -- MARK --",
+		// logrotate
+		"Oct 27 16:00:09 NHG-VYOS systemd[1]: Starting Rotate log files...",
+		"Oct 27 16:00:09 NHG-VYOS systemd[1]: Finished Rotate log files.",
+		"Oct 27 16:00:09 NHG-VYOS systemd[1]: logrotate.service: Deactivated successfully.",
+		// cron maintenance
+		"Oct 27 15:17:01 NHG-VYOS CRON[247503]: pam_unix(cron:session): session opened for user root(uid=0) by (uid=0)",
+		"Oct 27 15:17:01 NHG-VYOS CRON[247503]: pam_unix(cron:session): session closed for user root",
+		"Oct 27 15:17:01 NHG-VYOS CRON[247504]: (root) CMD (cd / && run-parts --report /etc/cron.hourly)",
+		"Oct 25 06:25:01 NHG-VyOS CRON[244992]: (CRON) info (No MTA installed, discarding output)",
+		"Oct 25 06:25:01 NHG-VyOS CRON[244993]: (root) CMD (test -x /usr/sbin/anacron || { cd / && run-parts --report /etc/cron.daily; })",
+		// kernel noise
+		"Oct 27 07:00:01 NHG-MIT-GW-02 kernel: ll header: 00000000: ff ff ff ff ff ff fa 16 3e 24 fe 8a 08 06",
+		"Oct 27 07:00:01 NHG-MIT-GW-02 kernel: net_ratelimit: 45 callbacks suppressed",
+		// IPC debug messages
+		`Oct 27 06:59:55 NHG-MIT-GW-01 keepalived-fifo.py[424042]: Received message: INSTANCE "LAN" MASTER_RX_LOWER_PRI 150`,
+		`Oct 27 06:59:55 NHG-MIT-GW-01 keepalived-fifo.py[424042]: INSTANCE LAN changed state to MASTER_RX_LOWER_PRI`,
+		`Oct 27 15:56:08 NHG-VYOS vyos-configd[798]: Received message: {"type": "init"}`,
+		`Oct 27 15:56:09 NHG-VYOS vyos-configd[798]: commit_scripts: ['policy']`,
+		`Oct 27 15:56:09 NHG-VYOS vyos-configd[798]: scripts_called: ['policy']`,
+		`Oct 27 15:56:09 NHG-VYOS vyos-configd[798]: config session pid is 249598`,
+		`Oct 27 15:56:10 NHG-VYOS watchfrr[1402]: [VTVCM-Y2NW3] Configuration Read in Took: 00:00:00`,
 	}
 	for _, raw := range suppressed {
 		got := SuppressOwn([]collector.LogEntry{e(raw)})

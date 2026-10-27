@@ -95,7 +95,10 @@ func mk(pattern, category, event, severity string) rule {
 
 // rules is the ordered classification table; the first match wins.
 var rules = []rule{
-	mk(`config_i|commit\[|cmdrecord|ui_commit|cfgpath=|configuration chang(?:e|ed)|clish\[\d+\]:\s*cmd by \S+:\s*start executing\s*:\s*(?:set|add|delete|remove|save|load)\b`,
+	mk(`error_commit|commit.*(?:failed|error)`,
+		collector.CategoryConfig, EventConfigChange, collector.SeverityError),
+
+	mk(`config_i|commit\[|cmdrecord|ui_commit|cfgpath=|configuration chang(?:e|ed)|configuration write completed|clish\[\d+\]:\s*cmd by \S+:\s*start executing\s*:\s*(?:set|add|delete|remove|save|load)\b`,
 		collector.CategoryConfig, EventConfigChange, collector.SeverityWarning),
 
 	mk(`login[ _]success(?:ful)?|successful login|accepted (?:password|publickey|keyboard-interactive)|logged in (?:successfully|from)|succeeded in logging in`,
@@ -110,7 +113,7 @@ var rules = []rule{
 	mk(`bgp.*adjchange.*down|bgp.*peer.*down|bgp.*from established|rpd_bgp_neighbor_state_changed.*(?:idle|active|connect)|bgp.*backward.?transition|bgp.*notification.*sent`,
 		collector.CategoryFault, EventBGPPeerDown, collector.SeverityError),
 
-	mk(`vrrp.*backup|vrrp.*master.*lost`,
+	mk(`vrrp.*backup|vrrp.*master.*lost|keepalived.*(?:entering (?:backup|fault)|changed state to (?:backup|fault))`,
 		collector.CategoryFault, EventVRRPTransition, collector.SeverityWarning),
 
 	mk(`stp.*topology.change|spanning-tree.*tcn|spantree.*topo`,
@@ -148,6 +151,12 @@ var rules = []rule{
 
 	mk(`changed state to up|link is up|link[ _]up|carrier (?:acquired|up)|ifoperstatus up|entered the up state|link state changed to up`,
 		collector.CategorySystem, EventLinkUp, collector.SeverityInfo),
+
+	mk(`vrrp.*(?:entering master|changed state to master)|keepalived.*(?:entering master|changed state to master)`,
+		collector.CategorySystem, EventVRRPTransition, collector.SeverityInfo),
+
+	mk(`keepalived.*(?:received advert.*lower priority|master_rx_lower_pri)`,
+		collector.CategorySystem, EventHAChange, collector.SeverityInfo),
 
 	mk(`cpu.*utilization.*[89][0-9]%|cpu.*100%`,
 		collector.CategorySystem, EventHighCPU, collector.SeverityWarning),
