@@ -70,8 +70,6 @@ func TestClassifierRules(t *testing.T) {
 		{"vrrp fault", "vyos", "Oct 20 09:44:05 R1 Keepalived_vrrp[9]: Entering FAULT STATE", "FAULT", EventVRRPTransition, "WARNING"},
 		{"vrrp master", "vyos", "Oct 20 09:44:05 R1 Keepalived_vrrp[9]: Entering MASTER STATE", "SYSTEM", EventVRRPTransition, "INFO"},
 		{"vrrp lower pri advert", "vyos", "Oct 20 09:44:05 R1 Keepalived_vrrp[9]: (LAN) Received advert from 10.134.4.3 with lower priority 100, ours 150, forcing new election", "SYSTEM", EventHAChange, "INFO"},
-		{"vyos commit error", "vyos", "Oct 20 09:44:05 R1 vyos-configd[798]: Sending reply: ERROR_COMMIT with output", "CONFIG", EventConfigChange, "ERROR"},
-		{"vyos config write", "vyos", "Oct 20 09:44:05 R1 watchfrr[1402]: [WFP93-1D146] configuration write completed with exit code 0", "CONFIG", EventConfigChange, "WARNING"},
 		{"stp", "cisco_ios", "Oct 20 09:31:02: %SPANTREE-5-TOPOTRAP: Topology Change Trap for vlan 100", "FAULT", EventSTPTCN, "WARNING"},
 		{"cpu", "cisco_ios", "Oct 20 09:31:02: %SYS-3-CPUHOG: CPU utilization for five seconds: 97%/3%", "SYSTEM", EventHighCPU, "WARNING"},
 		{"unknown", "cisco_ios", "Oct 20 09:31:02: %SYS-6-LOGGINGHOST_STARTSTOP: Logging to host 10.0.0.9 port 514 started", "SYSTEM", EventUnknown, "INFO"},
@@ -870,7 +868,10 @@ func TestSuppressOwn(t *testing.T) {
 		`Oct 27 15:56:09 NHG-VYOS vyos-configd[798]: commit_scripts: ['policy']`,
 		`Oct 27 15:56:09 NHG-VYOS vyos-configd[798]: scripts_called: ['policy']`,
 		`Oct 27 15:56:09 NHG-VYOS vyos-configd[798]: config session pid is 249598`,
+		`Oct 27 15:53:17 NHG-VYOS vyos-configd[798]: Sending reply: ERROR_COMMIT with output`,
+		`Oct 27 15:56:10 NHG-VYOS vyos-configd[798]: Sending reply: SUCCESS with output`,
 		`Oct 27 15:56:10 NHG-VYOS watchfrr[1402]: [VTVCM-Y2NW3] Configuration Read in Took: 00:00:00`,
+		`Oct 27 15:56:10 NHG-VYOS watchfrr[1402]: [WFP93-1D146] configuration write completed with exit code 0`,
 	}
 	for _, raw := range suppressed {
 		got := SuppressOwn([]collector.LogEntry{e(raw)})

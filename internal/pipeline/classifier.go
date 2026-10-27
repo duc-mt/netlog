@@ -95,10 +95,7 @@ func mk(pattern, category, event, severity string) rule {
 
 // rules is the ordered classification table; the first match wins.
 var rules = []rule{
-	mk(`error_commit|commit.*(?:failed|error)`,
-		collector.CategoryConfig, EventConfigChange, collector.SeverityError),
-
-	mk(`config_i|commit\[|cmdrecord|ui_commit|cfgpath=|configuration chang(?:e|ed)|configuration write completed|clish\[\d+\]:\s*cmd by \S+:\s*start executing\s*:\s*(?:set|add|delete|remove|save|load)\b`,
+	mk(`config_i|commit\[|cmdrecord|ui_commit|cfgpath=|configuration chang(?:e|ed)|clish\[\d+\]:\s*cmd by \S+:\s*start executing\s*:\s*(?:set|add|delete|remove|save|load)\b`,
 		collector.CategoryConfig, EventConfigChange, collector.SeverityWarning),
 
 	mk(`login[ _]success(?:ful)?|successful login|accepted (?:password|publickey|keyboard-interactive)|logged in (?:successfully|from)|succeeded in logging in`,

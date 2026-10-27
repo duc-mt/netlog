@@ -96,10 +96,10 @@ var ownSessionPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)kernel: ll header: [0-9a-f]{8}:`),
 	regexp.MustCompile(`(?i)kernel: net_ratelimit: \d+ callbacks suppressed`),
 
-	// VyOS internal IPC debug messages.
+	// VyOS internal IPC debug messages and daemon write status.
 	regexp.MustCompile(`(?i)keepalived-fifo\.py\[\d+\]: (?:Received message|INSTANCE \S+ changed state to MASTER_RX_LOWER_PRI)`),
-	regexp.MustCompile(`(?i)vyos-configd\[\d+\]: (?:Received message: \{"type":|commit_scripts:|scripts_called:|config session pid is)`),
-	regexp.MustCompile(`(?i)watchfrr\[\d+\]: \[VTVCM-Y2NW3\] Configuration Read in Took:`),
+	regexp.MustCompile(`(?i)vyos-configd\[\d+\]: (?:Received message|commit_scripts:|scripts_called:|config session pid is|Sending reply:)`),
+	regexp.MustCompile(`(?i)watchfrr\[\d+\]: \[(?:VTVCM-Y2NW3|WFP93-1D146)\] (?:Configuration Read in Took|configuration write completed)`),
 }
 
 // SuppressOwn returns a new slice that omits any entry whose Raw text matches
