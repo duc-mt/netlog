@@ -694,9 +694,9 @@ func TestReportEndToEnd(t *testing.T) {
 	}
 
 	changes := reportSection(t, out, "Change Accountability")
-	match(changes, `(?m)^bachngo\s+2\s+0$`)
-	match(changes, `(?m)^night\s+1\s+1$`)
-	match(changes, `(?m)^tanvt\s+1\s+0$`)
+	match(changes, `(?m)^bachngo\s+2\s+0\s+SW-CORE$`)
+	match(changes, `(?m)^night\s+1\s+1\s+SW-CORE$`)
+	match(changes, `(?m)^tanvt\s+1\s+0\s+SW-LAB$`)
 	match(changes, `After-hours changes: 1`)
 	match(changes, `(?m)^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\s+SW-CORE\s+night$`)
 	if !strings.Contains(changes, "?[2Jevil") {

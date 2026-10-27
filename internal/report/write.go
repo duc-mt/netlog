@@ -265,9 +265,15 @@ func writeChanges(p *printer, r Report, st query.Style) {
 	}
 	rows := make([][]string, len(ca.ByUser))
 	for i, u := range ca.ByUser {
-		rows[i] = []string{u.User, itoa(u.Count), itoa(u.AfterHours)}
+		hosts := strings.Join(u.Hostnames, ", ")
+		rows[i] = []string{u.User, itoa(u.Count), itoa(u.AfterHours), hosts}
 	}
-	grid(p, st, []column{{"USER", query.MaxUserCol, false}, {"CHANGES", maxNumCol, true}, {"AFTER-HOURS", maxNumCol, true}}, rows, nil)
+	grid(p, st, []column{
+		{"USER", query.MaxUserCol, false},
+		{"CHANGES", maxNumCol, true},
+		{"AFTER-HOURS", maxNumCol, true},
+		{"HOSTS", maxHostsCol, false},
+	}, rows, nil)
 
 	p.println("")
 	p.println(st.Bold("After-hours changes: " + itoa(ca.AfterHoursCount)))

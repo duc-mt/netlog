@@ -91,10 +91,10 @@ SW-LAB-LONG      13
 SW-CORE           6
 
 === Change Accountability (last 7d) ===
-USER       CHANGES  AFTER-HOURS
-alice            2            0
-bob              1            1
-(unknown)        1            0
+USER       CHANGES  AFTER-HOURS  HOSTS
+alice            2            0  SW-CORE
+bob              1            1  SW-CORE
+(unknown)        1            0  SW-LAB-LONG
 
 After-hours changes: 1
 TIME                 DEVICE   USER

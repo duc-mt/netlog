@@ -162,9 +162,10 @@ type DeviceFaultCount struct {
 
 // UserChangeCount is one row of the change-accountability table.
 type UserChangeCount struct {
-	User       string `json:"user"`
-	Count      int    `json:"count"`       // CONFIG_CHANGE + AFTER_HOURS_CHANGE
-	AfterHours int    `json:"after_hours"` // of which AFTER_HOURS_CHANGE
+	User       string   `json:"user"`
+	Count      int      `json:"count"`       // CONFIG_CHANGE + AFTER_HOURS_CHANGE
+	AfterHours int      `json:"after_hours"` // of which AFTER_HOURS_CHANGE
+	Hostnames  []string `json:"hostnames"`   // devices changed by this user
 }
 
 // AfterHoursChange is one AFTER_HOURS_CHANGE event.
@@ -356,7 +357,11 @@ type Builder struct {
 	incidentHosts map[string]*incidentTally
 }
 
-type changeTally struct{ total, afterHours int }
+type changeTally struct {
+	hosts      map[string]struct{}
+	total      int
+	afterHours int
+}
 
 type watchTally struct {
 	hosts      map[string]struct{}
@@ -447,8 +452,14 @@ func (b *Builder) AddEntry(e collector.LogEntry) {
 		u := userKey(e.User)
 		t := b.changes[u]
 		if t == nil {
-			t = &changeTally{}
+			t = &changeTally{hosts: make(map[string]struct{})}
 			b.changes[u] = t
+		}
+		if t.hosts == nil {
+			t.hosts = make(map[string]struct{})
+		}
+		if h := strings.TrimSpace(e.Hostname); h != "" {
+			t.hosts[h] = struct{}{}
 		}
 		t.total++
 		b.changeTotal++
@@ -678,7 +689,17 @@ func (b *Builder) changeAccountability() ChangeAccountability {
 	}
 	ca.AfterHoursCount = len(ca.AfterHours)
 	for u, t := range b.changes {
-		ca.ByUser = append(ca.ByUser, UserChangeCount{User: u, Count: t.total, AfterHours: t.afterHours})
+		hosts := make([]string, 0, len(t.hosts))
+		for h := range t.hosts {
+			hosts = append(hosts, h)
+		}
+		sort.Slice(hosts, func(i, j int) bool { return lessFold(hosts[i], hosts[j]) })
+		ca.ByUser = append(ca.ByUser, UserChangeCount{
+			User:       u,
+			Count:      t.total,
+			AfterHours: t.afterHours,
+			Hostnames:  hosts,
+		})
 	}
 	sort.Slice(ca.ByUser, func(i, j int) bool {
 		a, c := ca.ByUser[i], ca.ByUser[j]

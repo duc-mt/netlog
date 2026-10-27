@@ -153,9 +153,9 @@ func TestChangeAccountability(t *testing.T) {
 	ca := Compute(entries, nil, Options{}).ChangeAccountability
 
 	wantUsers := []UserChangeCount{
-		{"alice", 2, 0}, // alice and bob tie on 2: alphabetical
-		{"bob", 2, 1},
-		{UnknownUser, 6, 1}, // the biggest bucket still sorts last
+		{"alice", 2, 0, []string{"R1"}}, // alice and bob tie on 2: alphabetical
+		{"bob", 2, 1, []string{"R2"}},
+		{UnknownUser, 6, 1, []string{"R3", "R9"}}, // the biggest bucket still sorts last
 	}
 	if !reflect.DeepEqual(ca.ByUser, wantUsers) {
 		t.Errorf("ByUser = %+v\nwant     %+v", ca.ByUser, wantUsers)
