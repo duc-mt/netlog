@@ -656,52 +656,31 @@ func RunCommand(ctx context.Context, client *ssh.Client, command string, opts Op
 	session.Stdout = &stdout
 	session.Stderr = &stderr
 
-	stdin, err := session.StdinPipe()
-	if err != nil {
-		return "", fmt.Errorf("stdin pipe: %w", err)
-	}
-
 	done := make(chan error, 1)
 	go func() { done <- session.Run(command) }()
 
-	ticker := time.NewTicker(60 * time.Millisecond)
-	defer ticker.Stop()
-	deadline := time.Now().Add(opts.CommandTimeout)
-
-	for {
-		select {
-		case err := <-done:
-			out := stdout.String()
-			cleaned := pagerMarkerRe.ReplaceAllString(out, "")
-			if err != nil {
-				msg := strings.TrimSpace(stderr.String())
-				if msg != "" {
-					return cleaned, fmt.Errorf("command failed: %w (stderr: %s)", err, msg)
-				}
-				return cleaned, fmt.Errorf("command failed: %w", err)
+	select {
+	case err := <-done:
+		out := stdout.String()
+		cleaned := pagerMarkerRe.ReplaceAllString(out, "")
+		if err != nil {
+			msg := strings.TrimSpace(stderr.String())
+			if msg != "" {
+				return cleaned, fmt.Errorf("command failed: %w (stderr: %s)", err, msg)
 			}
-			return cleaned, nil
-
-		case <-ctx.Done():
-			_ = session.Signal(ssh.SIGKILL)
-			session.Close()
-			return "", ctx.Err()
-
-		case <-ticker.C:
-			if time.Now().After(deadline) {
-				_ = session.Signal(ssh.SIGKILL)
-				session.Close()
-				return "", fmt.Errorf("command timed out after %s", opts.CommandTimeout)
-			}
-			cur := stdout.String()
-			tail := cur
-			if len(tail) > 256 {
-				tail = tail[len(tail)-256:]
-			}
-			if pagerPromptRe.MatchString(tail) {
-				_, _ = stdin.Write([]byte(" "))
-			}
+			return cleaned, fmt.Errorf("command failed: %w", err)
 		}
+		return cleaned, nil
+
+	case <-ctx.Done():
+		_ = session.Signal(ssh.SIGKILL)
+		session.Close()
+		return "", ctx.Err()
+
+	case <-time.After(opts.CommandTimeout):
+		_ = session.Signal(ssh.SIGKILL)
+		session.Close()
+		return "", fmt.Errorf("command timed out after %s", opts.CommandTimeout)
 	}
 }
 
@@ -743,7 +722,7 @@ func RunInteractivePrompt(ctx context.Context, client *ssh.Client, commands []st
 	}
 	defer session.Close()
 
-	if err := session.RequestPty("xterm", 200, 800, ssh.TerminalModes{
+	if err := session.RequestPty("vt100", 50, 512, ssh.TerminalModes{
 		ssh.ECHO: 0,
 	}); err != nil {
 		return "", fmt.Errorf("requesting pty: %w", err)
@@ -766,17 +745,32 @@ func RunInteractivePrompt(ctx context.Context, client *ssh.Client, commands []st
 
 	if prompt != nil {
 		const poll = 40 * time.Millisecond
+		// Wake prompt on connect if switch sits at login banner
+		wakeTicker := time.NewTicker(600 * time.Millisecond)
+		defer wakeTicker.Stop()
+
 		waitPrompt := func(from int, what string) error {
 			for {
 				select {
 				case <-ctx.Done():
 					return ctx.Err()
+				case <-wakeTicker.C:
+					cur := output.String()
+					if len(cur) > from {
+						tail := cur[from:]
+						if !AtPrompt(tail, prompt) {
+							_, _ = fmt.Fprintf(stdin, "\n")
+						}
+					} else {
+						_, _ = fmt.Fprintf(stdin, "\n")
+					}
 				default:
 				}
 				cur := output.String()
 				if len(cur) > from {
 					tail := cur[from:]
 					if AtPrompt(tail, prompt) {
+						wakeTicker.Stop()
 						return nil
 					}
 					if pagerPromptRe.MatchString(tail) {
@@ -867,7 +861,7 @@ func RunInteractivePrompt(ctx context.Context, client *ssh.Client, commands []st
 }
 
 var (
-	reGaiaClishPrompt = regexp.MustCompile(`[\w.-]+(?: \([\w./-]+\))?>\s*$`)
+	reGaiaClishPrompt = regexp.MustCompile(`[\w.-]+(:[0-9a-zA-Z]+)?(?: \([\w./-]+\))?>\s*$`)
 	reGaiaBashPrompt  = regexp.MustCompile(`(?:\[?Expert@[\w.-]+[^\]]*\]?#|[\w.-]+#)\s*$`)
 	reGaiaExpPassReq  = regexp.MustCompile(`(?i)(?:enter\s+expert\s+password|password)\s*:\s*$`)
 )
@@ -885,7 +879,7 @@ func RunInteractiveGaia(ctx context.Context, client *ssh.Client, commands []stri
 	}
 	defer session.Close()
 
-	if err := session.RequestPty("xterm", 200, 800, ssh.TerminalModes{
+	if err := session.RequestPty("vt100", 50, 512, ssh.TerminalModes{
 		ssh.ECHO: 0,
 	}); err != nil {
 		return "", fmt.Errorf("requesting pty: %w", err)
@@ -907,12 +901,27 @@ func RunInteractiveGaia(ctx context.Context, client *ssh.Client, commands []stri
 	deadline := time.Now().Add(opts.CommandTimeout)
 	const poll = 40 * time.Millisecond
 
+	// Send an initial newline after a brief delay if no prompt appears,
+	// which wakes MOTD/banner prompts on Gaia firewalls.
+	wakeTicker := time.NewTicker(600 * time.Millisecond)
+	defer wakeTicker.Stop()
+
 	// 1. Wait for initial prompt (either clish '>' or bash '#')
 	inBash := false
 	for !inBash {
 		select {
 		case <-ctx.Done():
 			return "", ctx.Err()
+		case <-wakeTicker.C:
+			cur := output.String()
+			cleaned := reANSI.ReplaceAllString(cur, "")
+			lastLine := cleaned
+			if idx := strings.LastIndexAny(cleaned, "\r\n"); idx >= 0 {
+				lastLine = cleaned[idx+1:]
+			}
+			if !reGaiaBashPrompt.MatchString(lastLine) && !reGaiaClishPrompt.MatchString(lastLine) {
+				_, _ = fmt.Fprintf(stdin, "\n")
+			}
 		default:
 		}
 		if time.Now().After(deadline) {
@@ -932,6 +941,7 @@ func RunInteractiveGaia(ctx context.Context, client *ssh.Client, commands []stri
 		}
 
 		if reGaiaClishPrompt.MatchString(lastLine) {
+			wakeTicker.Stop()
 			// At clish prompt: enter expert mode
 			if _, err := fmt.Fprintf(stdin, "expert\n"); err != nil {
 				return "", fmt.Errorf("sending expert command: %w", err)
@@ -971,6 +981,7 @@ func RunInteractiveGaia(ctx context.Context, client *ssh.Client, commands []stri
 		}
 		time.Sleep(poll)
 	}
+	wakeTicker.Stop()
 
 	// 2. Execute commands in bash shell
 	var result strings.Builder

@@ -115,6 +115,19 @@ var clockMonths = map[string]time.Month{
 func ParseDeviceClock(vendorKey, output string, ref time.Time) (time.Time, error) {
 	loc := ref.Location()
 
+	// On FortiGate, "get system status" includes older database signature dates
+	// (e.g. "Virus-DB: 91.02634(2018-04-09 10:20)") which would mislead generic
+	// date parsers into thinking the device clock is years in the past.
+	// If "System time:" is present, restrict parsing to that line.
+	if vendorKey == "fortigate" {
+		for _, line := range strings.Split(output, "\n") {
+			if strings.HasPrefix(strings.TrimSpace(line), "System time:") {
+				output = line
+				break
+			}
+		}
+	}
+
 	tm := reClockHMS.FindStringSubmatchIndex(output)
 	if tm == nil {
 		return time.Time{}, fmt.Errorf("no time of day found in clock output %q", abbreviate(output))
