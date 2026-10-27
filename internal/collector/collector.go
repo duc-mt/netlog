@@ -162,13 +162,16 @@ type fetchPlan struct {
 // "FGT-01 (root) # ".
 var fortiPrompt = regexp.MustCompile(`^[\w.-]+(?: \([\w./-]+\))? [#$] ?$`)
 
+// ciscoSbPrompt matches Cisco Small Business CLI prompts such as "SW-01# " or "SW-01> ".
+var ciscoSbPrompt = regexp.MustCompile(`[\w.-]+(?: \([\w./-]+\))?[#>] ?$`)
+
 // logPlans maps a canonical vendor key (see vendor.CanonicalKey) to its log
 // fetch plan. None of these commands modify device state.
 var logPlans = map[string]fetchPlan{
 	"vyos":          {Commands: []string{"/opt/vyatta/bin/vyatta-op-cmd-wrapper show log tail 100"}},
 	"cisco_ios":     {Commands: []string{"show logging"}},
 	"cisco_asa":     {Commands: []string{"show logging"}},
-	"cisco_sb":      {Commands: []string{"show logging"}},
+	"cisco_sb":      {Interactive: true, Commands: []string{"terminal datadump", "show logging"}, Prompt: ciscoSbPrompt},
 	"huawei_vrp":    {Commands: []string{"display logbuffer"}},
 	"juniper_junos": {Commands: []string{"show log messages | last 100"}},
 	"fortigate":     {Interactive: true, Commands: []string{"execute log filter category 1", "execute log display"}, Prompt: fortiPrompt},
