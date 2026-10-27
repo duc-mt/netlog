@@ -57,6 +57,7 @@ const (
 	PlaybookHighCPU        = "high_cpu"
 	PlaybookOpticsAlarm    = "optics_alarm"
 	PlaybookBruteForce     = "brute_force"
+	PlaybookConfigDiff     = "config_diff"
 )
 
 // Signal priorities.
@@ -278,7 +279,14 @@ func (d *Detector) observe(e collector.LogEntry) []TriageSignal {
 	switch e.Event {
 	case EventConfigChange, EventAfterHoursChange:
 		st.lastConfig = &configChange{user: e.User, at: ts}
-		return nil
+		if !fresh {
+			return nil
+		}
+		prio := PriorityLow
+		if e.Event == EventAfterHoursChange {
+			prio = PriorityMedium
+		}
+		return []TriageSignal{d.signal(st, e, PlaybookConfigDiff, prio, false)}
 
 	case EventLinkFlap:
 		// A previously reported flap (replayed from storage): restore its

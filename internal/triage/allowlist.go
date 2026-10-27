@@ -57,6 +57,18 @@ var deniedWords = []string{
 	"conf", "set", "delete", "clear", "write", "reload", "restart", "copy", "format", "debug ip packet",
 }
 
+// allowedSafeDiffCommands are strictly read-only configuration diff inspection
+// commands that are permitted despite containing the substring "conf".
+var allowedSafeDiffCommands = map[string]struct{}{
+	"show system commit diff 0":                   {},
+	"show system rollback compare 0 1":            {},
+	"show configuration commit changes last 1":    {},
+	"display configuration commit changes last 1": {},
+	"show archive log config all":                 {},
+	"show configuration diffs":                    {},
+	"show session-config diff":                    {},
+}
+
 // Check reports why cmd may not be executed, or nil if it passes GATE 1.
 // The error text is for logging only; callers abort triage on any non-nil
 // result and do not retry.
@@ -73,7 +85,11 @@ func Check(cmd string) error {
 	}
 
 	lower := strings.ToLower(cmd)
+	_, isSafeDiff := allowedSafeDiffCommands[lower]
 	for _, w := range deniedWords {
+		if w == "conf" && isSafeDiff {
+			continue
+		}
 		if strings.Contains(lower, w) {
 			return fmt.Errorf("command %q contains blocked word %q", cmd, w)
 		}

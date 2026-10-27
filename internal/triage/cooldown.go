@@ -45,6 +45,8 @@ var cooldowns = map[string]time.Duration{
 	"BGP_PEER_DOWN":          5 * time.Minute,
 	"BRUTE_FORCE_ATTEMPT":    15 * time.Minute,
 	"PASSWORD_SPRAY_ATTEMPT": 15 * time.Minute,
+	"CONFIG_CHANGE":          2 * time.Minute,
+	"AFTER_HOURS_CHANGE":     2 * time.Minute,
 }
 
 // CooldownFor returns the cooldown period for an event type.

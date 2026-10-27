@@ -429,8 +429,19 @@ func TestSimpleSignalsAndStaleSuppression(t *testing.T) {
 	if s := f.d.Observe(ev("R1", EventOSPFAdjDown, "FAULT", "x", f.now.Add(-24*time.Hour))); len(s) != 0 {
 		t.Fatalf("stale entry produced a signal: %+v", s)
 	}
-	// Unclassified / auth success / config produce nothing.
-	for _, e := range []string{EventUnknown, EventLoginSuccess, EventConfigChange, EventCLICommand} {
+	if s := f.d.Observe(ev("R1", EventConfigChange, "CONFIG", "commit", f.now.Add(-24*time.Hour))); len(s) != 0 {
+		t.Fatalf("stale config entry produced a signal: %+v", s)
+	}
+	// Fresh config change triggers config diff playbook.
+	if s := f.d.Observe(ev("R1", EventConfigChange, "CONFIG", "commit", recent)); len(s) != 1 || s[0].Playbook != PlaybookConfigDiff || s[0].Priority != PriorityLow {
+		t.Errorf("fresh config change signal: %+v", s)
+	}
+	// Fresh after-hours change triggers config diff playbook with medium priority.
+	if s := f.d.Observe(ev("R1", EventAfterHoursChange, "CONFIG", "commit", recent)); len(s) != 1 || s[0].Playbook != PlaybookConfigDiff || s[0].Priority != PriorityMedium {
+		t.Errorf("fresh after-hours change signal: %+v", s)
+	}
+	// Unclassified / auth success / cli command produce nothing.
+	for _, e := range []string{EventUnknown, EventLoginSuccess, EventCLICommand} {
 		if s := f.d.Observe(ev("R1", e, "X", "x", recent)); len(s) != 0 {
 			t.Errorf("%s must not signal", e)
 		}

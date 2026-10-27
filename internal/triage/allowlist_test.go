@@ -40,6 +40,9 @@ func TestAllowlistAccepts(t *testing.T) {
 		"show ip bgp neighbors 10.1.1.1", "display bgp peer", "display users online", "display cpu-usage",
 		"/log print", "cat /proc/net/dev", "execute log display", "show vrrp", "show users",
 		"show processes cpu sorted | head 15", "show interfaces | include up", "show x | head 5 | include y",
+		"show system commit diff 0", "show system rollback compare 0 1",
+		"show configuration commit changes last 1", "display configuration commit changes last 1",
+		"show archive log config all", "show configuration diffs", "show session-config diff",
 	} {
 		if err := Check(cmd); err != nil {
 			t.Errorf("Check(%q) = %v, want nil", cmd, err)
@@ -189,6 +192,11 @@ func TestPlaybookCommands(t *testing.T) {
 		{"brute vyos", "vyos", "brute_force", "x", "show users"},
 		{"brute huawei", "huawei_vrp", "brute_force", "x", "display users online"},
 		{"junos link: fallback", "juniper_junos", "link_down", "x", "show interfaces terse"},
+		{"config_diff vyos", "vyos", "config_diff", "x", "show system commit diff 0"},
+		{"config_diff junos", "juniper_junos", "config_diff", "x", "show system rollback compare 0 1"},
+		{"config_diff cisco", "cisco_ios", "config_diff", "x", "show configuration commit changes last 1"},
+		{"config_diff huawei", "huawei_vrp", "config_diff", "x", "display configuration commit changes last 1"},
+		{"config_diff arista", "arista", "config_diff", "x", "show configuration diffs"},
 		{"mikrotik: no playbook", "mikrotik", "ospf_adj_down", "x", ""},
 		{"fortigate link: fallback", "fortigate", "link_down", "x", "get system interface physical"},
 		{"unknown playbook", "cisco_ios", "nope", "x", ""},
@@ -208,6 +216,7 @@ func TestCooldownPeriods(t *testing.T) {
 	for event, want := range map[string]time.Duration{
 		"LINK_DOWN": 10 * time.Minute, "LINK_FLAP": 10 * time.Minute, "OSPF_ADJ_DOWN": 5 * time.Minute,
 		"BGP_PEER_DOWN": 5 * time.Minute, "BRUTE_FORCE_ATTEMPT": 15 * time.Minute, "STP_TCN": DefaultCooldown,
+		"CONFIG_CHANGE": 2 * time.Minute, "AFTER_HOURS_CHANGE": 2 * time.Minute,
 	} {
 		if got := CooldownFor(event); got != want {
 			t.Errorf("CooldownFor(%s) = %v, want %v", event, got, want)

@@ -259,8 +259,8 @@ func TestCollectEndToEnd(t *testing.T) {
 	if d := time.Since(tanvt.Timestamp); d < 4*time.Minute || d > 6*time.Minute {
 		t.Errorf("corrected timestamp is %v old, want about 5m (event was 5m before the fake's 'now')", d)
 	}
-	if n := len(e.incidents(t)); n != 2 { // OSPF down + link down; the evil config line is not a fault
-		t.Fatalf("want 2 incidents (ospf_adj_down, link_down), got %d\n%s", n, stderr)
+	if n := len(e.incidents(t)); n != 3 { // OSPF down + link down + config diff; the evil config line is suppressed by cooldown
+		t.Fatalf("want 3 incidents (ospf_adj_down, link_down, config_diff), got %d\n%s", n, stderr)
 	}
 	if dev.count("show ip ospf neighbor") != 1 {
 		t.Errorf("ospf playbook should have run once, ran %d times", dev.count("show ip ospf neighbor"))
@@ -271,7 +271,7 @@ func TestCollectEndToEnd(t *testing.T) {
 
 	// ---- second poll of the same buffer: nothing new, nothing triaged ----
 	stderr, code = e.collect(t)
-	if code != 0 || len(e.logEntries(t)) != 4 || len(e.incidents(t)) != 2 {
+	if code != 0 || len(e.logEntries(t)) != 4 || len(e.incidents(t)) != 3 {
 		t.Fatalf("repeat poll must be idempotent: code=%d entries=%d incidents=%d\n%s", code, len(e.logEntries(t)), len(e.incidents(t)), stderr)
 	}
 	if !strings.Contains(stderr, "0 new log entries") {
@@ -284,7 +284,7 @@ func TestCollectEndToEnd(t *testing.T) {
 	if code != 0 || len(e.logEntries(t)) != 5 {
 		t.Fatalf("new line must be stored: code=%d entries=%d\n%s", code, len(e.logEntries(t)), stderr)
 	}
-	if dev.count("show ip ospf neighbor") != 1 || len(e.incidents(t)) != 2 {
+	if dev.count("show ip ospf neighbor") != 1 || len(e.incidents(t)) != 3 {
 		t.Errorf("cooldown must hold across runs: ospf execs=%d incidents=%d", dev.count("show ip ospf neighbor"), len(e.incidents(t)))
 	}
 	if !strings.Contains(stderr, "in cooldown") {
@@ -306,7 +306,7 @@ func TestCollectEndToEnd(t *testing.T) {
 		t.Errorf("timeline should attribute the OSPF fault to tanvt's change:\n%s", out)
 	}
 	out, _, code = e.run(t, "incidents", "--data-dir", filepath.Join(e.dir, "data"), "--since", "1h", "--no-color")
-	if code != 0 || !strings.Contains(out, "ospf_adj_down") || !strings.Contains(out, "link_down") {
+	if code != 0 || !strings.Contains(out, "ospf_adj_down") || !strings.Contains(out, "link_down") || !strings.Contains(out, "config_diff") {
 		t.Errorf("incidents list:\n%s", out)
 	}
 	id := e.incidents(t)[0].ID
@@ -722,10 +722,10 @@ func TestReportEndToEnd(t *testing.T) {
 	match(delta, `(?m)^TOTAL\s+4\s+14\s+\+10\s+\+250\.0%$`)
 
 	closure := reportSection(t, out, "Triage Reach")
-	match(closure, `Incidents:\s+5`)
-	match(closure, `All diagnostics succeeded:\s+2 \(40\.0%\)`)
-	match(closure, `Unreachable during triage:\s+2 \(40\.0%\)`)
-	match(closure, `Some commands failed:\s+1 \(20\.0%\)`)
+	match(closure, `Incidents:\s+6`)
+	match(closure, `All diagnostics succeeded:\s+3 \(50\.0%\)`)
+	match(closure, `Unreachable during triage:\s+2 \(33\.3%\)`)
+	match(closure, `Some commands failed:\s+1 \(16\.7%\)`)
 	match(closure, `(?m)^SW-GONE\s+2\s+2\s+yes$`)
 
 	// The collection that just ran left a health record: SW-LAB is fine, so
@@ -768,7 +768,7 @@ func TestReportEndToEnd(t *testing.T) {
 		w.Categories[3].ChangePct != nil || w.Total.Current != 14 || w.Total.Previous != 4 {
 		t.Errorf("week_over_week = %+v", w)
 	}
-	if ic := rep.IncidentClosure; ic.Total != 5 || ic.Succeeded != 2 || ic.Unreachable != 2 || ic.PartialFailure != 1 ||
+	if ic := rep.IncidentClosure; ic.Total != 6 || ic.Succeeded != 3 || ic.Unreachable != 2 || ic.PartialFailure != 1 ||
 		len(ic.UnreachableHosts) != 1 || ic.UnreachableHosts[0] != (report.UnreachableHost{Hostname: "SW-GONE", Unreachable: 2, Incidents: 2, Always: true}) {
 		t.Errorf("incident_closure = %+v", ic)
 	}

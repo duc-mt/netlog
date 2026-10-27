@@ -154,6 +154,14 @@ var usersSteps = map[string][]step{
 	famHuawei: {{"display users online", ""}},
 }
 
+var configDiffSteps = map[string][]step{
+	famVyOS:   {{"show system commit diff 0", ""}},
+	famJunos:  {{"show system rollback compare 0 1", ""}},
+	famCisco:  {{"show configuration commit changes last 1", "show archive log config all"}},
+	famHuawei: {{"display configuration commit changes last 1", ""}},
+	famArista: {{"show configuration diffs", "show session-config diff"}},
+}
+
 // playbooks maps playbook name -> platform family -> steps.
 var playbooks = map[string]map[string][]step{
 	pipeline.PlaybookLinkDown:    linkSteps,
@@ -173,6 +181,7 @@ var playbooks = map[string]map[string][]step{
 	},
 	pipeline.PlaybookOpticsAlarm: opticsSteps,
 	pipeline.PlaybookBruteForce:  usersSteps,
+	pipeline.PlaybookConfigDiff:  configDiffSteps,
 }
 
 // vyosTypes maps interface name prefixes to the VyOS interface type keyword
