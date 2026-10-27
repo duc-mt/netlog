@@ -35,8 +35,8 @@ import (
 )
 
 var (
-	pagerPromptRe = regexp.MustCompile(`(?i)(?:--\s*More(?:\s*\(\d+%\))?\s*--|---\(more(?:\s+\d+%)?\)---|\[More\]|Press any key to continue|<--- More --->)\s*$`)
-	pagerMarkerRe = regexp.MustCompile(`(?i)(?:--\s*More(?:\s*\(\d+%\))?\s*--|---\(more(?:\s+\d+%)?\)---|\[More\]|Press any key to continue|<--- More --->)`)
+	pagerPromptRe = regexp.MustCompile(`(?i)(?:-+\s*More(?:\s*\(?\s*\d+%\s*\)?)?\s*-+|---\(more(?:\s+\d+%)?\)---|\[More\]|Press any key to continue|<--- More --->)\s*$`)
+	pagerMarkerRe = regexp.MustCompile(`(?i)(?:-+\s*More(?:\s*\(?\s*\d+%\s*\)?)?\s*-+|---\(more(?:\s+\d+%)?\)---|\[More\]|Press any key to continue|<--- More --->)`)
 )
 
 type safeBuffer struct {
@@ -656,29 +656,52 @@ func RunCommand(ctx context.Context, client *ssh.Client, command string, opts Op
 	session.Stdout = &stdout
 	session.Stderr = &stderr
 
+	stdin, err := session.StdinPipe()
+	if err != nil {
+		return "", fmt.Errorf("stdin pipe: %w", err)
+	}
+
 	done := make(chan error, 1)
 	go func() { done <- session.Run(command) }()
 
-	select {
-	case err := <-done:
-		if err != nil {
-			msg := strings.TrimSpace(stderr.String())
-			if msg != "" {
-				return stdout.String(), fmt.Errorf("command failed: %w (stderr: %s)", err, msg)
+	ticker := time.NewTicker(60 * time.Millisecond)
+	defer ticker.Stop()
+	deadline := time.Now().Add(opts.CommandTimeout)
+
+	for {
+		select {
+		case err := <-done:
+			out := stdout.String()
+			cleaned := pagerMarkerRe.ReplaceAllString(out, "")
+			if err != nil {
+				msg := strings.TrimSpace(stderr.String())
+				if msg != "" {
+					return cleaned, fmt.Errorf("command failed: %w (stderr: %s)", err, msg)
+				}
+				return cleaned, fmt.Errorf("command failed: %w", err)
 			}
-			return stdout.String(), fmt.Errorf("command failed: %w", err)
+			return cleaned, nil
+
+		case <-ctx.Done():
+			_ = session.Signal(ssh.SIGKILL)
+			session.Close()
+			return "", ctx.Err()
+
+		case <-ticker.C:
+			if time.Now().After(deadline) {
+				_ = session.Signal(ssh.SIGKILL)
+				session.Close()
+				return "", fmt.Errorf("command timed out after %s", opts.CommandTimeout)
+			}
+			cur := stdout.String()
+			tail := cur
+			if len(tail) > 256 {
+				tail = tail[len(tail)-256:]
+			}
+			if pagerPromptRe.MatchString(tail) {
+				_, _ = stdin.Write([]byte(" "))
+			}
 		}
-		return stdout.String(), nil
-
-	case <-ctx.Done():
-		_ = session.Signal(ssh.SIGKILL)
-		session.Close()
-		return "", ctx.Err()
-
-	case <-time.After(opts.CommandTimeout):
-		_ = session.Signal(ssh.SIGKILL)
-		session.Close()
-		return "", fmt.Errorf("command timed out after %s", opts.CommandTimeout)
 	}
 }
 
@@ -841,4 +864,159 @@ func RunInteractivePrompt(ctx context.Context, client *ssh.Client, commands []st
 
 	cleaned := pagerMarkerRe.ReplaceAllString(reANSI.ReplaceAllString(output.String(), ""), "")
 	return cleaned, nil
+}
+
+var (
+	reGaiaClishPrompt = regexp.MustCompile(`[\w.-]+(?: \([\w./-]+\))?>\s*$`)
+	reGaiaBashPrompt  = regexp.MustCompile(`(?:\[?Expert@[\w.-]+[^\]]*\]?#|[\w.-]+#)\s*$`)
+	reGaiaExpPassReq  = regexp.MustCompile(`(?i)(?:enter\s+expert\s+password|password)\s*:\s*$`)
+)
+
+// RunInteractiveGaia handles Check Point Gaia SSH sessions. If the login lands
+// in clish (prompt ending in '>'), it automatically sends 'expert', feeds the
+// expertPassword if prompted, executes the given commands in bash, and exits.
+func RunInteractiveGaia(ctx context.Context, client *ssh.Client, commands []string, expertPassword string, opts Options) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	session, err := client.NewSession()
+	if err != nil {
+		return "", fmt.Errorf("opening session: %w", err)
+	}
+	defer session.Close()
+
+	if err := session.RequestPty("xterm", 200, 800, ssh.TerminalModes{
+		ssh.ECHO: 0,
+	}); err != nil {
+		return "", fmt.Errorf("requesting pty: %w", err)
+	}
+
+	stdin, err := session.StdinPipe()
+	if err != nil {
+		return "", fmt.Errorf("stdin pipe: %w", err)
+	}
+
+	var output safeBuffer
+	session.Stdout = &output
+	session.Stderr = &output
+
+	if err := session.Shell(); err != nil {
+		return "", fmt.Errorf("starting shell: %w", err)
+	}
+
+	deadline := time.Now().Add(opts.CommandTimeout)
+	const poll = 40 * time.Millisecond
+
+	// 1. Wait for initial prompt (either clish '>' or bash '#')
+	inBash := false
+	for !inBash {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		default:
+		}
+		if time.Now().After(deadline) {
+			return reANSI.ReplaceAllString(output.String(), ""), fmt.Errorf("timed out waiting for Gaia login prompt")
+		}
+
+		cur := output.String()
+		cleaned := reANSI.ReplaceAllString(cur, "")
+		lastLine := cleaned
+		if idx := strings.LastIndexAny(cleaned, "\r\n"); idx >= 0 {
+			lastLine = cleaned[idx+1:]
+		}
+
+		if reGaiaBashPrompt.MatchString(lastLine) {
+			inBash = true
+			break
+		}
+
+		if reGaiaClishPrompt.MatchString(lastLine) {
+			// At clish prompt: enter expert mode
+			if _, err := fmt.Fprintf(stdin, "expert\n"); err != nil {
+				return "", fmt.Errorf("sending expert command: %w", err)
+			}
+			// Wait for either password prompt or bash prompt
+			passwordSent := false
+		expertLoop:
+			for {
+				select {
+				case <-ctx.Done():
+					return "", ctx.Err()
+				default:
+				}
+				if time.Now().After(deadline) {
+					return reANSI.ReplaceAllString(output.String(), ""), fmt.Errorf("timed out waiting for expert shell")
+				}
+				time.Sleep(poll)
+
+				subCur := reANSI.ReplaceAllString(output.String(), "")
+				subLast := subCur
+				if idx := strings.LastIndexAny(subCur, "\r\n"); idx >= 0 {
+					subLast = subCur[idx+1:]
+				}
+
+				if reGaiaBashPrompt.MatchString(subLast) {
+					inBash = true
+					break expertLoop
+				}
+
+				if !passwordSent && reGaiaExpPassReq.MatchString(subLast) {
+					if _, err := fmt.Fprintf(stdin, "%s\n", expertPassword); err != nil {
+						return "", fmt.Errorf("sending expert password: %w", err)
+					}
+					passwordSent = true
+				}
+			}
+		}
+		time.Sleep(poll)
+	}
+
+	// 2. Execute commands in bash shell
+	var result strings.Builder
+	for _, cmd := range commands {
+		from := output.Len()
+		if _, err := fmt.Fprintf(stdin, "%s\n", cmd); err != nil {
+			return result.String(), fmt.Errorf("writing command %q: %w", cmd, err)
+		}
+
+		// Wait for command completion (bash prompt)
+		for {
+			select {
+			case <-ctx.Done():
+				return result.String(), ctx.Err()
+			default:
+			}
+			if time.Now().After(deadline) {
+				return result.String(), fmt.Errorf("timed out waiting for command %q to finish", cmd)
+			}
+			time.Sleep(poll)
+
+			cur := output.String()
+			if len(cur) > from {
+				tail := cur[from:]
+				cleanedTail := reANSI.ReplaceAllString(tail, "")
+				last := cleanedTail
+				if idx := strings.LastIndexAny(cleanedTail, "\r\n"); idx >= 0 {
+					last = cleanedTail[idx+1:]
+				}
+				if reGaiaBashPrompt.MatchString(last) {
+					// Command completed; strip the command echo and the trailing prompt
+					lines := strings.Split(cleanedTail, "\n")
+					if len(lines) > 1 {
+						// Drop first line (command echo) and last line (prompt)
+						bodyLines := lines[1 : len(lines)-1]
+						for _, bl := range bodyLines {
+							result.WriteString(strings.TrimRight(bl, "\r"))
+							result.WriteString("\n")
+						}
+					}
+					break
+				}
+			}
+		}
+	}
+
+	_, _ = fmt.Fprintf(stdin, "exit\n")
+	return result.String(), nil
 }

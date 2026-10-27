@@ -324,7 +324,7 @@ type syslogLine struct {
 
 var (
 	reSyslogISO  = regexp.MustCompile(`^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)(Z|[+-]\d{2}:?\d{2})?\s+(\S+)\s+([^\s:\[\]]+)(?:\[(\d+)\])?:\s*(.*)$`)
-	reSyslog3164 = regexp.MustCompile(`^([A-Za-z]{3})\s+(\d{1,2})\s+(?:(\d{4})\s+)?(\d{2}:\d{2}:\d{2}(?:\.\d+)?)\s+(\S+)\s+([^\s:\[\]]+)(?:\[(\d+)\])?:\s*(.*)$`)
+	reSyslog3164 = regexp.MustCompile(`^([A-Za-z]{3})\s+(\d{1,2})\s+(?:(\d{4})\s+)?(\d{2}:\d{2}:\d{2}(?:\.\d+)?)(?:\s+(\d{4}))?\s+(\S+)\s+([^\s:\[\]]+)(?:\[(\d+)\])?:\s*(.*)$`)
 )
 
 // parseSyslog parses ISO 8601 and classic syslog lines.
@@ -352,8 +352,12 @@ func parseSyslog(line string, o Options) (syslogLine, bool) {
 		}
 		day, _ := strconv.Atoi(m[2])
 		var ts time.Time
-		if m[3] != "" {
-			y, _ := strconv.Atoi(m[3])
+		yearStr := m[3]
+		if yearStr == "" {
+			yearStr = m[5]
+		}
+		if yearStr != "" {
+			y, _ := strconv.Atoi(yearStr)
 			ts, ok = buildTime(y, mon, day, m[4], o.loc())
 		} else {
 			ts, ok = buildYearless(mon, day, m[4], o)
@@ -361,7 +365,7 @@ func parseSyslog(line string, o Options) (syslogLine, bool) {
 		if !ok {
 			return syslogLine{}, false
 		}
-		return syslogLine{ts: ts, host: m[5], prog: m[6], pid: m[7], msg: m[8]}, true
+		return syslogLine{ts: ts, host: m[6], prog: m[7], pid: m[8], msg: m[9]}, true
 	}
 	return syslogLine{}, false
 }

@@ -31,9 +31,10 @@ import (
 )
 
 const (
-	EnvUsername = "NETLOG_USERNAME"
-	EnvPassword = "NETLOG_PASSWORD"
-	EnvKeyFile  = "NETLOG_KEY_FILE"
+	EnvUsername       = "NETLOG_USERNAME"
+	EnvPassword       = "NETLOG_PASSWORD"
+	EnvKeyFile        = "NETLOG_KEY_FILE"
+	EnvExpertPassword = "NETLOG_EXPERT_PASSWORD"
 
 	// Global jump / bastion host defaults.  Per-named-jump credentials use
 	// NETLOG_JUMP_<NAME>_USERNAME / _PASSWORD / _KEY_FILE (same group-key pattern as
@@ -71,9 +72,10 @@ type JumpCredentials struct {
 }
 
 type Credentials struct {
-	Username string
-	Password string
-	KeyFile  string
+	Username       string
+	Password       string
+	KeyFile        string
+	ExpertPassword string
 }
 
 // Store caches configuration and credentials for the default profile and
@@ -114,9 +116,10 @@ func NewStore(envFile string) (*Store, error) {
 	}
 
 	defaultCreds := Credentials{
-		Username: s.lookup(EnvUsername),
-		Password: s.lookup(EnvPassword),
-		KeyFile:  s.lookup(EnvKeyFile),
+		Username:       s.lookup(EnvUsername),
+		Password:       s.lookup(EnvPassword),
+		KeyFile:        s.lookup(EnvKeyFile),
+		ExpertPassword: s.lookup(EnvExpertPassword),
 	}
 
 	if defaultCreds.Username == "" {
@@ -162,10 +165,12 @@ func (s *Store) ForGroup(group string) Credentials {
 	userKey := fmt.Sprintf("NETLOG_%s_USERNAME", cleanGroup)
 	passKey := fmt.Sprintf("NETLOG_%s_PASSWORD", cleanGroup)
 	fileKey := fmt.Sprintf("NETLOG_%s_KEY_FILE", cleanGroup)
+	expKey := fmt.Sprintf("NETLOG_%s_EXPERT_PASSWORD", cleanGroup)
 
 	u := s.lookup(userKey)
 	p := s.lookup(passKey)
 	k := s.lookup(fileKey)
+	exp := s.lookup(expKey)
 
 	if u == "" {
 		u = s.defaultCreds.Username
@@ -174,8 +179,11 @@ func (s *Store) ForGroup(group string) Credentials {
 		p = s.defaultCreds.Password
 		k = s.defaultCreds.KeyFile
 	}
+	if exp == "" {
+		exp = s.defaultCreds.ExpertPassword
+	}
 
-	return Credentials{Username: u, Password: p, KeyFile: k}
+	return Credentials{Username: u, Password: p, KeyFile: k, ExpertPassword: exp}
 }
 
 // JumpDefaults returns the global bastion / jump host connection details

@@ -19,6 +19,7 @@ import (
 	"netlog/internal/collector"
 	"netlog/internal/credentials"
 	"netlog/internal/inventory"
+	"netlog/internal/pipeline"
 	"netlog/internal/sshclient"
 )
 
@@ -68,12 +69,14 @@ func runDryRun(ctx context.Context, o collectOpts, log *stderrLogger, stdout, st
 	}
 
 	coll := collector.New(collector.Config{
-		SSH:             sshOpts,
-		CredStore:       creds,
-		JumpEnabled:     o.jumpEnabled,
-		JumpDefaultHost: o.jumpHost,
-		Concurrency:     o.concurrency,
-		Logger:          log,
+		SSH:               sshOpts,
+		CredStore:         creds,
+		JumpEnabled:       o.jumpEnabled,
+		JumpDefaultHost:   o.jumpHost,
+		Concurrency:       o.concurrency,
+		ClockParser:       pipeline.ParseDeviceClock,
+		WarnOnSkewFailure: true,
+		Logger:            log,
 	})
 
 	log.Info("dry-run: probing %d device(s) with concurrency %d...", len(devices), o.concurrency)

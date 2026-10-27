@@ -58,8 +58,10 @@ func TestStoreForGroup(t *testing.T) {
 	content := `
 NETLOG_USERNAME=default_admin
 NETLOG_PASSWORD=default_secret
+NETLOG_EXPERT_PASSWORD=default_expert
 NETLOG_SITE_A_USERNAME=site_a_user
 NETLOG_SITE_A_PASSWORD=site_a_pass
+NETLOG_SITE_A_EXPERT_PASSWORD=site_a_expert
 NETLOG_PARTIAL_USERNAME=partial_user
 `
 	if err := os.WriteFile(envPath, []byte(content), 0o600); err != nil {
@@ -73,25 +75,25 @@ NETLOG_PARTIAL_USERNAME=partial_user
 
 	// 1. Default group
 	cDef := store.ForGroup("")
-	if cDef.Username != "default_admin" || cDef.Password != "default_secret" {
+	if cDef.Username != "default_admin" || cDef.Password != "default_secret" || cDef.ExpertPassword != "default_expert" {
 		t.Errorf("unexpected default creds: %+v", cDef)
 	}
 
 	// 2. Specific group site_a
 	cSiteA := store.ForGroup("site_a")
-	if cSiteA.Username != "site_a_user" || cSiteA.Password != "site_a_pass" {
+	if cSiteA.Username != "site_a_user" || cSiteA.Password != "site_a_pass" || cSiteA.ExpertPassword != "site_a_expert" {
 		t.Errorf("unexpected site_a creds: %+v", cSiteA)
 	}
 
-	// 3. Partial group (password falls back to default)
+	// 3. Partial group (password and expert password fall back to default)
 	cPartial := store.ForGroup("partial")
-	if cPartial.Username != "partial_user" || cPartial.Password != "default_secret" {
+	if cPartial.Username != "partial_user" || cPartial.Password != "default_secret" || cPartial.ExpertPassword != "default_expert" {
 		t.Errorf("unexpected partial creds: %+v", cPartial)
 	}
 
 	// 4. Unknown group (fully falls back to default)
 	cUnknown := store.ForGroup("nonexistent")
-	if cUnknown.Username != "default_admin" || cUnknown.Password != "default_secret" {
+	if cUnknown.Username != "default_admin" || cUnknown.Password != "default_secret" || cUnknown.ExpertPassword != "default_expert" {
 		t.Errorf("unexpected unknown creds: %+v", cUnknown)
 	}
 }

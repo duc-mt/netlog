@@ -203,6 +203,8 @@ func TestParseDeviceClock(t *testing.T) {
 			time.Date(2026, 10, 20, 9, 31, 0, 0, ict), time.Date(2026, 10, 20, 9, 31, 2, 0, ict)},
 		{"time only, device just past midnight", "fortigate", "current time is: 00:00:05\n",
 			time.Date(2026, 10, 20, 23, 59, 50, 0, utc), time.Date(2026, 10, 21, 0, 0, 5, 0, utc)},
+		{"fortigate get system status", "fortigate", "Version: FortiGate-100E v7.0.12\nHostname: FG1\nSystem time: Tue Oct 20 09:31:02 2026\n",
+			time.Date(2026, 10, 20, 9, 31, 0, 0, utc), time.Date(2026, 10, 20, 9, 31, 2, 0, utc)},
 		{"time only, device just before midnight", "generic", "23:59:55",
 			time.Date(2026, 10, 21, 0, 0, 3, 0, utc), time.Date(2026, 10, 20, 23, 59, 55, 0, utc)},
 	}

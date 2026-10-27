@@ -148,6 +148,9 @@ type fetchPlan struct {
 	Interactive bool
 	Commands    []string
 
+	// CheckPointGaia uses Gaia expert-mode handling.
+	CheckPointGaia bool
+
 	// Prompt matches the device's CLI prompt (the last line of the output
 	// once a command has finished). Interactive plans wait for it instead of
 	// guessing from silence, which would return an empty log page whenever
@@ -173,13 +176,10 @@ var logPlans = map[string]fetchPlan{
 	"ruijie":        {Commands: []string{"show logging"}},
 	"mikrotik":      {Commands: []string{"/log print"}},
 
-	// pfSense 2.5+ and Check Point Gaia keep plain-text syslog files. They
-	// are read with tail over an exec channel, which needs a login that is
-	// allowed a shell (pfSense: admin or a user with shell access; Gaia: a
-	// user whose shell is /bin/bash, not clish). The pfSense command reads
-	// both the system and the authentication log (-q: no file headers).
+	// pfSense 2.5+ keeps plain-text syslog files.
+	// Check Point Gaia can land in clish, so it uses CheckPointGaia expert mode handling.
 	"pfsense":         {Commands: []string{"tail -q -n 300 /var/log/system.log /var/log/auth.log"}},
-	"checkpoint_gaia": {Commands: []string{"tail -n 300 /var/log/messages"}},
+	"checkpoint_gaia": {CheckPointGaia: true, Commands: []string{"tail -n 300 /var/log/messages"}},
 	"arista":          {Commands: []string{"show logging last 100 lines"}},
 	"paloalto":        {Commands: []string{"show log system"}},
 	"generic":         {Commands: []string{"show logging"}},
@@ -203,7 +203,7 @@ var clockCommands = map[string]string{
 	"checkpoint_gaia": "date",
 	"juniper_junos":   "show system uptime",
 	"mikrotik":        "/system clock print",
-	"fortigate":       "get system time",
+	"fortigate":       "get system status",
 	"generic":         "show clock",
 }
 
@@ -490,6 +490,11 @@ type Config struct {
 	// collector skips the clock command and every Result reports SkewOK=false.
 	ClockParser ClockParser
 
+	// WarnOnSkewFailure controls whether clock skew capture errors emit a WARN
+	// message. Defaults to false so routine log polling isn't flooded with warnings
+	// when platforms drop the secondary channel after log retrieval.
+	WarnOnSkewFailure bool
+
 	// Logger receives collector diagnostics. Nil disables them.
 	Logger Logger
 }
@@ -674,7 +679,7 @@ func (c *Collector) pollOne(ctx context.Context, dev inventory.Device) (res Resu
 	}
 	defer client.Close()
 
-	raw, err := runPlan(ctx, client, plan, c.cfg.SSH)
+	raw, err := c.runPlanForDev(ctx, client, plan, dev, c.cfg.SSH)
 	if err != nil {
 		res.Err = errcat.Classify(dev.Hostname, "command", err)
 		return res
@@ -693,8 +698,30 @@ func (c *Collector) pollOne(ctx context.Context, dev inventory.Device) (res Resu
 // single exec command, even on a fast link.
 var minInteractiveTimeout = 15 * time.Second
 
-// runPlan executes a fetch plan on an open connection.
 func runPlan(ctx context.Context, client *ssh.Client, plan fetchPlan, opts sshclient.Options) (string, error) {
+	return runPlanWithCreds(ctx, client, plan, "", opts)
+}
+
+func (c *Collector) runPlanForDev(ctx context.Context, client *ssh.Client, plan fetchPlan, dev inventory.Device, opts sshclient.Options) (string, error) {
+	expertPass := ""
+	if c.cfg.CredStore != nil {
+		creds := c.cfg.CredStore.ForGroup(dev.CredentialGroup)
+		expertPass = creds.ExpertPassword
+	}
+	return runPlanWithCreds(ctx, client, plan, expertPass, opts)
+}
+
+// runPlanWithCreds executes a fetch plan on an open connection.
+func runPlanWithCreds(ctx context.Context, client *ssh.Client, plan fetchPlan, expertPassword string, opts sshclient.Options) (string, error) {
+	if plan.CheckPointGaia {
+		timeout := opts.CommandTimeout
+		if timeout < minInteractiveTimeout {
+			timeout = minInteractiveTimeout
+		}
+		intOpts := opts
+		intOpts.CommandTimeout = timeout
+		return sshclient.RunInteractiveGaia(ctx, client, plan.Commands, expertPassword, intOpts)
+	}
 	if plan.Interactive {
 		timeout := opts.CommandTimeout
 		if timeout < minInteractiveTimeout {
@@ -754,13 +781,14 @@ func (c *Collector) captureClockSkew(ctx context.Context, client *ssh.Client, de
 	res.SkewOK = true
 }
 
-// recordSkewErr stores a skew failure on the result and warns once per
-// device, so a platform whose clock command is wrong does not flood the log
-// every poll.
+// recordSkewErr stores a skew failure on the result and optionally warns once per
+// device if WarnOnSkewFailure is configured.
 func (c *Collector) recordSkewErr(dev inventory.Device, res *Result, err error) {
 	res.SkewErr = err
-	if _, seen := c.skewWarned.LoadOrStore(dev.Hostname, struct{}{}); !seen {
-		c.log.Warn("%s: clock skew unavailable, timestamps left uncorrected: %v", dev.Hostname, err)
+	if c.cfg.WarnOnSkewFailure {
+		if _, seen := c.skewWarned.LoadOrStore(dev.Hostname, struct{}{}); !seen {
+			c.log.Warn("%s: clock skew unavailable, timestamps left uncorrected: %v", dev.Hostname, err)
+		}
 	}
 }
 
