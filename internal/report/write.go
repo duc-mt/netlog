@@ -27,7 +27,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"netlog/internal/query"
 )
@@ -38,10 +37,11 @@ const noData = "No matching events."
 
 // Column caps for values that are not covered by the shared query constants.
 const (
-	maxNumCol   = 20
-	maxIPCol    = 45 // longest textual IPv6 address
-	maxHostsCol = 60
-	maxDayCol   = len(dayLayout)
+	maxDeviceCol = 64 // generous cap for enterprise switch hostnames
+	maxNumCol    = 20
+	maxIPCol     = 45 // longest textual IPv6 address
+	maxHostsCol  = 60
+	maxDayCol    = len(dayLayout)
 )
 
 // ==============================================================================
@@ -140,64 +140,12 @@ func (p *printer) println(s string) {
 	_, p.err = fmt.Fprintln(p.w, s)
 }
 
-// column describes one table column.
-type column struct {
-	title string
-	limit int  // values are clipped to this many runes
-	right bool // right-align, for numbers
-}
+type column = Column
 
-// grid prints cols and rows as an aligned table: a bold header line, then
-// one line per row. Every value is clipped (and so sanitised) here. paint, if
-// set, colours a whole row; the last left-aligned column is not padded, so
-// lines carry no trailing spaces.
+// grid prints cols and rows as an aligned table using NetOps-style rounded box borders.
+// Cell contents that exceed column width wrap across multiple lines inside their cells.
 func grid(p *printer, st query.Style, cols []column, rows [][]string, paint func(row int, line string) string) {
-	widths := make([]int, len(cols))
-	for c, col := range cols {
-		vals := make([]string, len(rows))
-		for r := range rows {
-			vals[r] = rows[r][c]
-		}
-		widths[c] = query.Widest(col.title, vals, col.limit)
-	}
-
-	line := func(cells []string) string {
-		parts := make([]string, len(cols))
-		for c, col := range cols {
-			text := query.Clip(cells[c], col.limit)
-			switch {
-			case col.right:
-				parts[c] = padLeft(text, widths[c])
-			case c == len(cols)-1:
-				parts[c] = text
-			default:
-				parts[c] = query.Pad(text, widths[c])
-			}
-		}
-		// An empty last cell must not leave padding behind.
-		return strings.TrimRight(strings.Join(parts, "  "), " ")
-	}
-
-	titles := make([]string, len(cols))
-	for c, col := range cols {
-		titles[c] = col.title
-	}
-	p.println(st.Bold(line(titles)))
-	for i, row := range rows {
-		s := line(row)
-		if paint != nil {
-			s = paint(i, s)
-		}
-		p.println(s)
-	}
-}
-
-// padLeft left-pads s with spaces to width w, counting runes.
-func padLeft(s string, w int) string {
-	if n := utf8.RuneCountInString(s); n < w {
-		return strings.Repeat(" ", w-n) + s
-	}
-	return s
+	renderBoxTable(p, st, cols, rows, paint)
 }
 
 // heading prints a bold "=== title ===" line. The title may contain the
@@ -251,7 +199,7 @@ func writeNoisy(p *printer, r Report, st query.Style) {
 	for i, d := range r.NoisyDevices {
 		rows[i] = []string{query.Dash(d.Hostname), itoa(d.Count)}
 	}
-	grid(p, st, []column{{"DEVICE", query.MaxDeviceCol, false}, {"FAULTS", maxNumCol, true}}, rows, nil)
+	grid(p, st, []column{{"DEVICE", maxDeviceCol, false}, {"FAULTS", maxNumCol, true}}, rows, nil)
 }
 
 // ---- 2. change accountability -----------------------------------------------
@@ -285,7 +233,7 @@ func writeChanges(p *printer, r Report, st query.Style) {
 	for i, e := range ca.AfterHours {
 		ah[i] = []string{e.Timestamp.In(loc).Format("2006-01-02 15:04:05"), e.Hostname, e.User}
 	}
-	grid(p, st, []column{{"TIME", len("2006-01-02 15:04:05"), false}, {"DEVICE", query.MaxDeviceCol, false}, {"USER", query.MaxUserCol, false}}, ah,
+	grid(p, st, []column{{"TIME", len("2006-01-02 15:04:05"), false}, {"DEVICE", maxDeviceCol, false}, {"USER", query.MaxUserCol, false}}, ah,
 		func(_ int, line string) string { return st.Yellow(line) })
 }
 
@@ -411,7 +359,7 @@ func writeClosure(p *printer, r Report, st query.Style) {
 		}
 		rows[i] = []string{h.Hostname, itoa(h.Unreachable), itoa(h.Incidents), always}
 	}
-	cols := []column{{"DEVICE", query.MaxDeviceCol, false}, {"UNREACHABLE", maxNumCol, true}, {"INCIDENTS", maxNumCol, true}, {"ALWAYS", 6, true}}
+	cols := []column{{"DEVICE", maxDeviceCol, false}, {"UNREACHABLE", maxNumCol, true}, {"INCIDENTS", maxNumCol, true}, {"ALWAYS", 6, true}}
 	grid(p, st, cols, rows, func(i int, line string) string {
 		if ic.UnreachableHosts[i].Always {
 			return st.Red(line)
@@ -475,7 +423,7 @@ func writeOutages(p *printer, r Report, st query.Style) {
 		}
 		rows[i] = []string{x.Hostname, x.Kind, x.Object, x.Down.In(loc).Format("2006-01-02 15:04:05"), dur}
 	}
-	cols := []column{{"DEVICE", query.MaxDeviceCol, false}, {"KIND", 4, false}, {"OBJECT", 30, false}, {"DOWN", len("2006-01-02 15:04:05"), false}, {"DURATION", 20, true}}
+	cols := []column{{"DEVICE", maxDeviceCol, false}, {"KIND", 4, false}, {"OBJECT", 30, false}, {"DOWN", len("2006-01-02 15:04:05"), false}, {"DURATION", 20, true}}
 	grid(p, st, cols, rows, func(i int, line string) string {
 		if o.Longest[i].Open {
 			return st.Red(line) // still down

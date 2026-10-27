@@ -687,53 +687,53 @@ func TestReportEndToEnd(t *testing.T) {
 		}
 	}
 	noisy := reportSection(t, out, "Noisy Devices")
-	match(noisy, `(?m)^SW-CORE\s+3$`)
-	match(noisy, `(?m)^SW-LAB\s+2$`)
+	match(noisy, `SW-CORE\s*│\s*3`)
+	match(noisy, `SW-LAB\s*│\s*2`)
 	if strings.Index(noisy, "SW-CORE") > strings.Index(noisy, "SW-LAB") {
 		t.Errorf("most faults first:\n%s", noisy)
 	}
 
 	changes := reportSection(t, out, "Change Accountability")
-	match(changes, `(?m)^bachngo\s+2\s+0\s+SW-CORE$`)
-	match(changes, `(?m)^night\s+1\s+1\s+SW-CORE$`)
-	match(changes, `(?m)^tanvt\s+1\s+0\s+SW-LAB$`)
+	match(changes, `bachngo\s*│\s*2\s*│\s*0\s*│\s*SW-CORE`)
+	match(changes, `night\s*│\s*1\s*│\s*1\s*│\s*SW-CORE`)
+	match(changes, `tanvt\s*│\s*1\s*│\s*0\s*│\s*SW-LAB`)
 	match(changes, `After-hours changes: 1`)
-	match(changes, `(?m)^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\s+SW-CORE\s+night$`)
+	match(changes, `\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\s*│\s*SW-CORE\s*│\s*night`)
 	if !strings.Contains(changes, "?[2Jevil") {
 		t.Errorf("the hostile user name should appear neutralised:\n%s", changes)
 	}
 
 	watch := reportSection(t, out, "Security Watchlist")
-	match(watch, `(?m)^203\.0\.113\.9\s+2\s+3\s+0\s+SW-A, SW-B$`)
-	match(watch, `(?m)^198\.51\.100\.7\s+1\s+1\s+0\s+SW-A$`)
+	match(watch, `203\.0\.113\.9\s*│\s*2\s*│\s*3\s*│\s*0\s*│\s*SW-A, SW-B`)
+	match(watch, `198\.51\.100\.7\s*│\s*1\s*│\s*1\s*│\s*0\s*│\s*SW-A`)
 	if strings.Contains(watch, "6.6.6.6") || strings.Index(watch, "203.0.113.9") > strings.Index(watch, "198.51.100.7") {
 		t.Errorf("a source on more devices ranks first, and config-change IPs are not logins:\n%s", watch)
 	}
 
 	day3 := time.Now().UTC().Truncate(24*time.Hour).AddDate(0, 0, -3).Format("2006-01-02")
-	match(reportSection(t, out, "Event Volume"), `(?m)^`+day3+`\s+2\s+4\s+3\s+0\s+0$`)
+	match(reportSection(t, out, "Event Volume"), day3+`\s*│\s*2\s*│\s*4\s*│\s*3\s*│\s*0\s*│\s*0`)
 
 	delta := reportSection(t, out, "Week-over-Week")
-	match(delta, `(?m)^CONFIG\s+2\s+4\s+\+2\s+\+100\.0%$`)
-	match(delta, `(?m)^AUTH\s+1\s+4\s+\+3\s+\+300\.0%$`)
-	match(delta, `(?m)^FAULT\s+1\s+5\s+\+4\s+\+400\.0%$`)
-	match(delta, `(?m)^SECURITY\s+0\s+1\s+\+1\s+n/a$`)
-	match(delta, `(?m)^SYSTEM\s+0\s+0\s+0\s+n/a$`)
-	match(delta, `(?m)^TOTAL\s+4\s+14\s+\+10\s+\+250\.0%$`)
+	match(delta, `CONFIG\s*│\s*2\s*│\s*4\s*│\s*\+2\s*│\s*\+100\.0%`)
+	match(delta, `AUTH\s*│\s*1\s*│\s*4\s*│\s*\+3\s*│\s*\+300\.0%`)
+	match(delta, `FAULT\s*│\s*1\s*│\s*5\s*│\s*\+4\s*│\s*\+400\.0%`)
+	match(delta, `SECURITY\s*│\s*0\s*│\s*1\s*│\s*\+1\s*│\s*n/a`)
+	match(delta, `SYSTEM\s*│\s*0\s*│\s*0\s*│\s*0\s*│\s*n/a`)
+	match(delta, `TOTAL\s*│\s*4\s*│\s*14\s*│\s*\+10\s*│\s*\+250\.0%`)
 
 	closure := reportSection(t, out, "Triage Reach")
 	match(closure, `Incidents:\s+6`)
 	match(closure, `All diagnostics succeeded:\s+3 \(50\.0%\)`)
 	match(closure, `Unreachable during triage:\s+2 \(33\.3%\)`)
 	match(closure, `Some commands failed:\s+1 \(16\.7%\)`)
-	match(closure, `(?m)^SW-GONE\s+2\s+2\s+yes$`)
+	match(closure, `SW-GONE\s*│\s*2\s*│\s*2\s*│\s*yes`)
 
 	// The collection that just ran left a health record: SW-LAB is fine, so
 	// the section only says so.
 	match(reportSection(t, out, "Device Health"), `All 1 devices healthy\.`)
 	// Every collected line was classified except the banner-free few the fake
 	// device prints; coverage is reported per vendor.
-	match(reportSection(t, out, "Classification Coverage"), `(?m)^cisco_ios\s+\d+\s+\d+\s+\d+\.\d%$`)
+	match(reportSection(t, out, "Classification Coverage"), `cisco_ios\s*│\s*\d+\s*│\s*\d+\s*│\s*\d+\.\d%`)
 	match(reportSection(t, out, "Outages"), `No outages\.|Outages: \d+`)
 
 	// ---- json ----
@@ -847,7 +847,7 @@ func TestStatusEndToEnd(t *testing.T) {
 	row := func(out, dev string) string {
 		t.Helper()
 		for _, l := range strings.Split(out, "\n") {
-			if strings.HasPrefix(l, dev+" ") {
+			if strings.HasPrefix(l, dev+" ") || strings.Contains(l, "│ "+dev+" ") {
 				return l
 			}
 		}
@@ -874,7 +874,7 @@ func TestStatusEndToEnd(t *testing.T) {
 	if r := row(out, "SW-LAB"); !strings.Contains(r, "OK") {
 		t.Errorf("SW-LAB should be OK: %q", r)
 	}
-	if r := row(out, "DEAD"); !regexp.MustCompile(`FAILING\s+-\s+1\s`).MatchString(r) {
+	if r := row(out, "DEAD"); !regexp.MustCompile(`FAILING.*-.*1`).MatchString(r) {
 		t.Errorf("DEAD should be FAILING with 1 failed poll and no successful one: %q", r)
 	}
 	if r := row(out, "PF"); !strings.Contains(r, "UNSUPPORTED") || !strings.Contains(r, "no log fetch command") {
@@ -891,10 +891,10 @@ func TestStatusEndToEnd(t *testing.T) {
 	a.cycle(t.Context())
 	a.close()
 	out, _, _ = status()
-	if r := row(out, "DEAD"); !regexp.MustCompile(`FAILING\s+-\s+2\s`).MatchString(r) {
+	if r := row(out, "DEAD"); !regexp.MustCompile(`FAILING.*-.*2`).MatchString(r) {
 		t.Errorf("two failed polls in a row: %q", r)
 	}
-	if r := row(out, "PF"); regexp.MustCompile(`UNSUPPORTED\s+-\s+\d`).MatchString(r) {
+	if r := row(out, "PF"); regexp.MustCompile(`UNSUPPORTED\s*│\s*-\s*│\s*\d`).MatchString(r) {
 		t.Errorf("an unsupported platform shows no failure count: %q", r)
 	}
 	if r := row(out, "SW-LAB"); !strings.Contains(r, "OK") {

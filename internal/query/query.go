@@ -318,7 +318,7 @@ func severityColor(sev string) string {
 
 // Reasonable caps keep one long hostname or message from wrecking alignment.
 const (
-	maxDeviceCol  = 24
+	maxDeviceCol  = 64
 	maxUserCol    = 14
 	maxEventCol   = 22
 	maxSummaryCol = 160

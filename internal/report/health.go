@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"io"
 	"sort"
+	"strings"
 	"time"
 
 	"netlog/internal/query"
@@ -206,6 +207,20 @@ func detail(r DeviceStatus, loc *time.Location) string {
 	return d
 }
 
+func formatStatusWithIcon(status string) string {
+	s := strings.ToUpper(status)
+	switch {
+	case strings.Contains(s, "OK"), strings.Contains(s, "SUCCESS"):
+		return "✔ " + status
+	case strings.Contains(s, "TIMEOUT"), strings.Contains(s, "STALE"):
+		return "⏱ " + status
+	case strings.Contains(s, "FAIL"), strings.Contains(s, "ERROR"):
+		return "✖ " + status
+	default:
+		return status
+	}
+}
+
 // writeStatusGrid prints the device table shared by the status command and the
 // report section.
 func writeStatusGrid(p *printer, st query.Style, rows []DeviceStatus) {
@@ -218,26 +233,35 @@ func writeStatusGrid(p *printer, st query.Style, rows []DeviceStatus) {
 		if r.ConsecutiveFailures > 0 && store.Status(r.Status) != store.StatusUnsupported {
 			fails = itoa(r.ConsecutiveFailures)
 		}
-		cells[i] = []string{r.Hostname, r.Status, clock(r.LastSuccess, loc), fails, clock(r.LastNewLogs, loc), detail(r, loc)}
+		det := detail(r, loc)
+		if det == "" {
+			det = "-"
+		}
+		cells[i] = []string{r.Hostname, formatStatusWithIcon(r.Status), clock(r.LastSuccess, loc), fails, clock(r.LastNewLogs, loc), det}
 	}
 	cols := []column{
-		{"DEVICE", query.MaxDeviceCol, false},
-		{"STATUS", 12, false},
+		{"DEVICE", maxDeviceCol, false},
+		{"STATUS", 16, false},
 		{"LAST POLL OK", 16, false},
 		{"FAILS", maxNumCol, true},
 		{"LAST NEW LOGS", 16, false},
 		{"DETAIL", maxDetailCol, false},
 	}
-	grid(p, st, cols, cells, func(i int, line string) string {
+	grid(p, st, cols, cells, func(i int, cellText string) string {
 		switch store.Status(rows[i].Status) {
+		case store.StatusOK:
+			if strings.Contains(cellText, "OK") {
+				return st.Green(cellText)
+			}
+			return cellText
 		case store.StatusFailing, store.StatusStale:
-			return st.Red(line)
+			return st.Red(cellText)
 		case store.StatusSilent, store.StatusUnparseable:
-			return st.Yellow(line)
+			return st.Yellow(cellText)
 		case store.StatusUnsupported, store.StatusNever:
-			return st.Dim(line)
+			return st.Dim(cellText)
 		}
-		return line
+		return cellText
 	})
 }
 

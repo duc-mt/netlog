@@ -20,6 +20,8 @@ import (
 	"netlog/internal/credentials"
 	"netlog/internal/inventory"
 	"netlog/internal/pipeline"
+	"netlog/internal/query"
+	"netlog/internal/report"
 	"netlog/internal/sshclient"
 )
 
@@ -125,45 +127,24 @@ func printDryRunTable(w io.Writer, results []dryResult, useColor bool) {
 		return
 	}
 
-	wDev := len("DEVICE")
-	wAddr := len("ADDRESS")
-	wVend := len("VENDOR")
-
-	for _, r := range results {
-		if len(r.dev.Hostname) > wDev {
-			wDev = len(r.dev.Hostname)
-		}
-		addr := r.dev.Address
-		if r.dev.Port != 0 && r.dev.Port != 22 {
-			addr = fmt.Sprintf("%s:%d", r.dev.Address, r.dev.Port)
-		}
-		if len(addr) > wAddr {
-			wAddr = len(addr)
-		}
-		if len(r.vendor) > wVend {
-			wVend = len(r.vendor)
-		}
+	cols := []report.Column{
+		{Title: "DEVICE", Limit: 64, Right: false},
+		{Title: "ADDRESS", Limit: 24, Right: false},
+		{Title: "VENDOR", Limit: 16, Right: false},
+		{Title: "STATUS", Limit: 12, Right: false},
+		{Title: "DURATION", Limit: 12, Right: true},
+		{Title: "SKEW", Limit: 10, Right: true},
+		{Title: "NOTES", Limit: 60, Right: false},
 	}
 
-	paint := func(code, s string) string {
-		if !useColor || code == "" {
-			return s
-		}
-		return code + s + "\x1b[0m"
-	}
-
-	header := fmt.Sprintf("%-*s  %-*s  %-*s  %-6s  %-8s  %-8s  %s",
-		wDev, "DEVICE", wAddr, "ADDRESS", wVend, "VENDOR", "STATUS", "DURATION", "SKEW", "NOTES")
-	fmt.Fprintln(w, paint("\x1b[1m", header))
-
-	for _, r := range results {
+	rows := make([][]string, len(results))
+	for i, r := range results {
 		addr := r.dev.Address
 		if r.dev.Port != 0 && r.dev.Port != 22 {
 			addr = fmt.Sprintf("%s:%d", r.dev.Address, r.dev.Port)
 		}
 
-		status := "OK"
-		statusCode := "\x1b[32m" // green
+		status := "✔ OK"
 		notes := "Connected"
 		if r.bytes > 0 {
 			notes = fmt.Sprintf("Connected (buffer: %d bytes)", r.bytes)
@@ -172,8 +153,7 @@ func printDryRunTable(w io.Writer, results []dryResult, useColor bool) {
 			notes += " via " + r.dev.JumpHost
 		}
 		if !r.success {
-			status = "FAIL"
-			statusCode = "\x1b[31m" // red
+			status = "✖ FAIL"
 			notes = r.err.Error()
 		}
 
@@ -181,19 +161,20 @@ func printDryRunTable(w io.Writer, results []dryResult, useColor bool) {
 		if r.skewOK {
 			skewStr = fmt.Sprintf("%+dms", r.skewMs)
 		}
-
 		durStr := r.duration.Round(time.Millisecond).String()
 
-		row := fmt.Sprintf("%-*s  %-*s  %-*s  %-6s  %-8s  %-8s  %s",
-			wDev, r.dev.Hostname,
-			wAddr, addr,
-			wVend, r.vendor,
-			paint(statusCode, status),
-			durStr,
-			skewStr,
-			notes,
-		)
-		fmt.Fprintln(w, row)
+		rows[i] = []string{r.dev.Hostname, addr, r.vendor, status, durStr, skewStr, notes}
 	}
+
+	st := query.Style{Color: useColor}
+	_ = report.WriteBoxTable(w, st, cols, rows, func(rowIdx int, cellText string) string {
+		if !results[rowIdx].success {
+			return st.Red(cellText)
+		}
+		if strings.Contains(cellText, "OK") {
+			return st.Green(cellText)
+		}
+		return cellText
+	})
 	fmt.Fprintln(w)
 }

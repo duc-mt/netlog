@@ -86,44 +86,62 @@ func table(t *testing.T, r Report, st query.Style) string {
 // headings and number formatting.
 func TestWriteTableGolden(t *testing.T) {
 	want := `=== Noisy Devices (top 10, last 7d) ===
-DEVICE       FAULTS
-SW-LAB-LONG      13
-SW-CORE           6
+╭─────────────┬────────╮
+│ DEVICE      │ FAULTS │
+├─────────────┼────────┤
+│ SW-LAB-LONG │     13 │
+│ SW-CORE     │      6 │
+╰─────────────┴────────╯
 
 === Change Accountability (last 7d) ===
-USER       CHANGES  AFTER-HOURS  HOSTS
-alice            2            0  SW-CORE
-bob              1            1  SW-CORE
-(unknown)        1            0  SW-LAB-LONG
+╭───────────┬─────────┬─────────────┬─────────────╮
+│ USER      │ CHANGES │ AFTER-HOURS │ HOSTS       │
+├───────────┼─────────┼─────────────┼─────────────┤
+│ alice     │       2 │           0 │ SW-CORE     │
+│ bob       │       1 │           1 │ SW-CORE     │
+│ (unknown) │       1 │           0 │ SW-LAB-LONG │
+╰───────────┴─────────┴─────────────┴─────────────╯
 
 After-hours changes: 1
-TIME                 DEVICE   USER
-2026-10-24 18:00:00  SW-CORE  bob
+╭─────────────────────┬─────────┬──────╮
+│ TIME                │ DEVICE  │ USER │
+├─────────────────────┼─────────┼──────┤
+│ 2026-10-24 18:00:00 │ SW-CORE │ bob  │
+╰─────────────────────┴─────────┴──────╯
 
 === Security Watchlist (top 10, last 7d) ===
-SOURCE IP     DEVICES  FAILURES  DETECTED  HOSTS
-203.0.113.9         2         2         0  SW-CORE, SW-LAB-LONG
-198.51.100.7        1         1         0  SW-CORE
+╭──────────────┬─────────┬──────────┬──────────┬──────────────────────╮
+│ SOURCE IP    │ DEVICES │ FAILURES │ DETECTED │ HOSTS                │
+├──────────────┼─────────┼──────────┼──────────┼──────────────────────┤
+│ 203.0.113.9  │       2 │        2 │        0 │ SW-CORE, SW-LAB-LONG │
+│ 198.51.100.7 │       1 │        1 │        0 │ SW-CORE              │
+╰──────────────┴─────────┴──────────┴──────────┴──────────────────────╯
 
 === Event Volume by Category/Day (UTC, last 7d) ===
-DAY         CONFIG  AUTH  FAULT  SECURITY  SYSTEM
-2026-10-17       0     0      0         0       0
-2026-10-18       0     0      0         0       0
-2026-10-19       0     0      0         0       0
-2026-10-20       0     0      0         0       0
-2026-10-21       0     0      0         0       0
-2026-10-22       0     0      0         0       0
-2026-10-23       0     0      3         0       0
-2026-10-24       3     3     16         1       8
+╭────────────┬────────┬──────┬───────┬──────────┬────────╮
+│ DAY        │ CONFIG │ AUTH │ FAULT │ SECURITY │ SYSTEM │
+├────────────┼────────┼──────┼───────┼──────────┼────────┤
+│ 2026-10-17 │      0 │    0 │     0 │        0 │      0 │
+│ 2026-10-18 │      0 │    0 │     0 │        0 │      0 │
+│ 2026-10-19 │      0 │    0 │     0 │        0 │      0 │
+│ 2026-10-20 │      0 │    0 │     0 │        0 │      0 │
+│ 2026-10-21 │      0 │    0 │     0 │        0 │      0 │
+│ 2026-10-22 │      0 │    0 │     0 │        0 │      0 │
+│ 2026-10-23 │      0 │    0 │     3 │        0 │      0 │
+│ 2026-10-24 │      3 │    3 │    16 │        1 │      8 │
+╰────────────┴────────┴──────┴───────┴──────────┴────────╯
 
 === Week-over-Week (last 7d vs previous 7d) ===
-CATEGORY  PREVIOUS  CURRENT  CHANGE  CHANGE %
-CONFIG           0        3      +3       n/a
-AUTH             0        3      +3       n/a
-FAULT            5       19     +14   +280.0%
-SECURITY         0        1      +1       n/a
-SYSTEM           0        8      +8       n/a
-TOTAL            5       34     +29   +580.0%
+╭──────────┬──────────┬─────────┬────────┬──────────╮
+│ CATEGORY │ PREVIOUS │ CURRENT │ CHANGE │ CHANGE % │
+├──────────┼──────────┼─────────┼────────┼──────────┤
+│ CONFIG   │        0 │       3 │     +3 │      n/a │
+│ AUTH     │        0 │       3 │     +3 │      n/a │
+│ FAULT    │        5 │      19 │    +14 │  +280.0% │
+│ SECURITY │        0 │       1 │     +1 │      n/a │
+│ SYSTEM   │        0 │       8 │     +8 │      n/a │
+│ TOTAL    │        5 │      34 │    +29 │  +580.0% │
+╰──────────┴──────────┴─────────┴────────┴──────────╯
 
 === Triage Reach (last 7d) ===
 Incidents:                  3
@@ -132,8 +150,11 @@ Unreachable during triage:  2 (66.7%)
 Some commands failed:       0 (0.0%)
 
 Devices unreachable during triage:
-DEVICE   UNREACHABLE  INCIDENTS  ALWAYS
-SW-GONE            2          2     yes
+╭─────────┬─────────────┬───────────┬────────╮
+│ DEVICE  │ UNREACHABLE │ INCIDENTS │ ALWAYS │
+├─────────┼─────────────┼───────────┼────────┤
+│ SW-GONE │           2 │         2 │    yes │
+╰─────────┴─────────────┴───────────┴────────╯
 
 === Outages (top 10 by duration, last 7d) ===
 Outages: 3 (2 resolved, 1 still open)
@@ -141,21 +162,30 @@ Mean time to recover: 35m (resolved outages only)
 Longest: 1h
 Untracked: 1 outage start(s) whose log line names no interface or neighbor, so no recovery can be matched
 
-DEVICE       KIND  OBJECT    DOWN                    DURATION
-SW-LAB-LONG  ospf  10.1.1.2  2026-10-24 16:00:00           1h
-SW-CORE      bgp   10.0.0.1  2026-10-24 18:30:00  30m+ (open)
-SW-CORE      link  Gi0/1     2026-10-24 13:00:00          10m
+╭─────────────┬──────┬──────────┬─────────────────────┬─────────────╮
+│ DEVICE      │ KIND │ OBJECT   │ DOWN                │    DURATION │
+├─────────────┼──────┼──────────┼─────────────────────┼─────────────┤
+│ SW-LAB-LONG │ ospf │ 10.1.1.2 │ 2026-10-24 16:00:00 │          1h │
+│ SW-CORE     │ bgp  │ 10.0.0.1 │ 2026-10-24 18:30:00 │ 30m+ (open) │
+│ SW-CORE     │ link │ Gi0/1    │ 2026-10-24 13:00:00 │         10m │
+╰─────────────┴──────┴──────────┴─────────────────────┴─────────────╯
 
 === Device Health (collection status now) ===
 2 of 3 devices need attention:
-DEVICE   STATUS       LAST POLL OK  FAILS  LAST NEW LOGS  DETAIL
-SW-GONE  FAILING      -                47  -              dial tcp 10.0.0.9:22: i/o timeout
-PF-EDGE  UNSUPPORTED  -                 -  -              PF-EDGE: no log fetch command for this platform
+╭─────────┬─────────────┬──────────────┬───────┬───────────────┬─────────────────────────────────────────────────╮
+│ DEVICE  │ STATUS      │ LAST POLL OK │ FAILS │ LAST NEW LOGS │ DETAIL                                          │
+├─────────┼─────────────┼──────────────┼───────┼───────────────┼─────────────────────────────────────────────────┤
+│ SW-GONE │ ✖ FAILING   │ -            │    47 │ -             │ dial tcp 10.0.0.9:22: i/o timeout               │
+│ PF-EDGE │ UNSUPPORTED │ -            │     - │ -             │ PF-EDGE: no log fetch command for this platform │
+╰─────────┴─────────────┴──────────────┴───────┴───────────────┴─────────────────────────────────────────────────╯
 
 === Classification Coverage (last 7d) ===
-VENDOR     LINES  UNKNOWN  UNKNOWN %
-pfsense        6        6     100.0%
-cisco_ios     28        0       0.0%
+╭───────────┬───────┬─────────┬───────────╮
+│ VENDOR    │ LINES │ UNKNOWN │ UNKNOWN % │
+├───────────┼───────┼─────────┼───────────┤
+│ pfsense   │     6 │       6 │    100.0% │
+│ cisco_ios │    28 │       0 │      0.0% │
+╰───────────┴───────┴─────────┴───────────╯
 `
 	got := table(t, fixture(), query.Style{Location: ict})
 	if got != want {
@@ -286,13 +316,16 @@ func TestWriteTableNeutralisesHostileText(t *testing.T) {
 	}
 }
 
-// Over-long device text is cut, not allowed to wreck the table.
-func TestWriteTableClipsLongValues(t *testing.T) {
+// Over-long device text wraps across multiple lines, preserving content without wrecking the table.
+func TestWriteTableWrapsLongValues(t *testing.T) {
 	long := strings.Repeat("H", 80)
 	rep := Compute([]collector.LogEntry{fault(long, t0)}, nil, Options{Since: t0.Add(-Week), Until: t0})
 	got := table(t, rep, query.Style{})
-	if strings.Contains(got, long) || !strings.Contains(got, strings.Repeat("H", query.MaxDeviceCol-1)+"…") {
-		t.Errorf("hostname should be clipped to %d columns:\n%s", query.MaxDeviceCol, got)
+	if strings.Contains(got, long) {
+		t.Errorf("unbroken 80-char string should not appear on one line:\n%s", got)
+	}
+	if !strings.Contains(got, strings.Repeat("H", maxDeviceCol)) || !strings.Contains(got, strings.Repeat("H", 80-maxDeviceCol)) {
+		t.Errorf("hostname should be wrapped to %d columns:\n%s", maxDeviceCol, got)
 	}
 }
 

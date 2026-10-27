@@ -49,6 +49,9 @@ func (s Style) Bold(text string) string { return s.paint(ansiBold, text) }
 // Dim renders text dimmed when colour is enabled.
 func (s Style) Dim(text string) string { return s.paint(ansiDim, text) }
 
+// Green renders text green when colour is enabled.
+func (s Style) Green(text string) string { return s.paint(ansiGreen, text) }
+
 // Red renders text red when colour is enabled.
 func (s Style) Red(text string) string { return s.paint(ansiRed, text) }
 

@@ -96,12 +96,15 @@ func TestWriteDeviceStatus(t *testing.T) {
 	if err := WriteDeviceStatus(&b, rows, query.Style{Location: ict}); err != nil {
 		t.Fatal(err)
 	}
-	want := `DEVICE   STATUS        LAST POLL OK      FAILS  LAST NEW LOGS     DETAIL
-dist-2   FAILING       2026-10-23 13:00     47  -                 dial tcp 10.0.0.2:22: i/o timeout
-quiet-3  SILENT        2026-10-24 18:59      -  2026-10-23 03:00  reachable, but no new log lines since 2026-10-23 03:00
-new-4    NEVER POLLED  -                     -  -                 in the inventory but never polled
-pf       UNSUPPORTED   -                     -  -                 pf: netlog has no log fetch command for this platform
-core-1   OK            2026-10-24 18:59      -  2026-10-24 18:00
+	want := `╭─────────┬──────────────┬──────────────────┬───────┬──────────────────┬────────────────────────────────────────────────────────╮
+│ DEVICE  │ STATUS       │ LAST POLL OK     │ FAILS │ LAST NEW LOGS    │ DETAIL                                                 │
+├─────────┼──────────────┼──────────────────┼───────┼──────────────────┼────────────────────────────────────────────────────────┤
+│ dist-2  │ ✖ FAILING    │ 2026-10-23 13:00 │    47 │ -                │ dial tcp 10.0.0.2:22: i/o timeout                      │
+│ quiet-3 │ SILENT       │ 2026-10-24 18:59 │     - │ 2026-10-23 03:00 │ reachable, but no new log lines since 2026-10-23 03:00 │
+│ new-4   │ NEVER POLLED │ -                │     - │ -                │ in the inventory but never polled                      │
+│ pf      │ UNSUPPORTED  │ -                │     - │ -                │ pf: netlog has no log fetch command for this platform  │
+│ core-1  │ ✔ OK         │ 2026-10-24 18:59 │     - │ 2026-10-24 18:00 │ -                                                      │
+╰─────────┴──────────────┴──────────────────┴───────┴──────────────────┴────────────────────────────────────────────────────────╯
 `
 	if got := b.String(); got != want {
 		t.Errorf("status table changed.\n--- got ---\n%s\n--- want ---\n%s", got, want)
