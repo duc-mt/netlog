@@ -87,11 +87,11 @@ func ComputeDelta(device, iface string, prev, curr InterfaceCounter) InterfaceDe
 // Regex patterns for interface counter parsing across common platforms.
 var (
 	// Cisco: "GigabitEthernet0/1 is up ... 1000 packets input, 80000 bytes, 2 input errors, 1 CRC, 0 dropped"
-	reCiscoIface = regexp.MustCompile(`^(\S+) is (?:up|down|administratively down)`)
-	reCiscoIn    = regexp.MustCompile(`(\d+) packets input,\s+(\d+) bytes`)
-	reCiscoOut   = regexp.MustCompile(`(\d+) packets output,\s+(\d+) bytes`)
-	reCiscoInErr = regexp.MustCompile(`(\d+) input errors`)
-	reCiscoInDrp = regexp.MustCompile(`(\d+) (?:input|total) (?:drops|dropped)`)
+	reCiscoIface  = regexp.MustCompile(`^(\S+) is (?:up|down|administratively down)`)
+	reCiscoIn     = regexp.MustCompile(`(\d+) packets input,\s+(\d+) bytes`)
+	reCiscoOut    = regexp.MustCompile(`(\d+) packets output,\s+(\d+) bytes`)
+	reCiscoInErr  = regexp.MustCompile(`(\d+) input errors`)
+	reCiscoInDrp  = regexp.MustCompile(`(\d+) (?:input|total) (?:drops|dropped)`)
 	reCiscoOutErr = regexp.MustCompile(`(\d+) output errors`)
 	reCiscoOutDrp = regexp.MustCompile(`(\d+) (?:output) (?:drops|dropped)`)
 
@@ -99,15 +99,15 @@ var (
 	reProcNetDev = regexp.MustCompile(`^\s*([a-zA-Z0-9_.-]+):\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+\d+\s+\d+\s+\d+\s+\d+\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)`)
 
 	// Juniper: "Physical interface: ge-0/0/0, Enabled, ..."
-	reJunosIface   = regexp.MustCompile(`^Physical interface:\s*(\S+)`)
-	reJunosInBytes = regexp.MustCompile(`Input bytes\s*:\s*(\d+)`)
+	reJunosIface    = regexp.MustCompile(`^Physical interface:\s*(\S+)`)
+	reJunosInBytes  = regexp.MustCompile(`Input bytes\s*:\s*(\d+)`)
 	reJunosOutBytes = regexp.MustCompile(`Output bytes\s*:\s*(\d+)`)
-	reJunosInPkts  = regexp.MustCompile(`Input packets\s*:\s*(\d+)`)
-	reJunosOutPkts = regexp.MustCompile(`Output packets\s*:\s*(\d+)`)
-	reJunosInErr   = regexp.MustCompile(`Input errors\s*:\s*(\d+)`)
-	reJunosInDrop  = regexp.MustCompile(`Input drops\s*:\s*(\d+)`)
-	reJunosOutErr  = regexp.MustCompile(`Output errors\s*:\s*(\d+)`)
-	reJunosOutDrop = regexp.MustCompile(`Output drops\s*:\s*(\d+)`)
+	reJunosInPkts   = regexp.MustCompile(`Input packets\s*:\s*(\d+)`)
+	reJunosOutPkts  = regexp.MustCompile(`Output packets\s*:\s*(\d+)`)
+	reJunosInErr    = regexp.MustCompile(`Input errors\s*:\s*(\d+)`)
+	reJunosInDrop   = regexp.MustCompile(`Input drops\s*:\s*(\d+)`)
+	reJunosOutErr   = regexp.MustCompile(`Output errors\s*:\s*(\d+)`)
+	reJunosOutDrop  = regexp.MustCompile(`Output drops\s*:\s*(\d+)`)
 )
 
 // ParseCiscoInterfaces parses "show interfaces" text output.

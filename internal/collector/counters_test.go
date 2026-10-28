@@ -121,22 +121,22 @@ func TestComputeDelta(t *testing.T) {
 	t1 := t0.Add(10 * time.Second)
 
 	prev := InterfaceCounter{
-		Timestamp:   t0,
-		InOctets:    100000,
-		OutOctets:   50000,
-		InPackets:   1000,
-		OutPackets:  500,
-		InErrors:    2,
-		InDiscards:  1,
+		Timestamp:  t0,
+		InOctets:   100000,
+		OutOctets:  50000,
+		InPackets:  1000,
+		OutPackets: 500,
+		InErrors:   2,
+		InDiscards: 1,
 	}
 	curr := InterfaceCounter{
-		Timestamp:   t1,
-		InOctets:    110000, // +10000 bytes in 10s = 8000 bps
-		OutOctets:   60000,  // +10000 bytes in 10s = 8000 bps
-		InPackets:   1100,   // +100 pkts in 10s = 10 pps
-		OutPackets:  550,    // +50 pkts in 10s = 5 pps
-		InErrors:    5,      // +3 errors
-		InDiscards:  3,      // +2 drops
+		Timestamp:  t1,
+		InOctets:   110000, // +10000 bytes in 10s = 8000 bps
+		OutOctets:  60000,  // +10000 bytes in 10s = 8000 bps
+		InPackets:  1100,   // +100 pkts in 10s = 10 pps
+		OutPackets: 550,    // +50 pkts in 10s = 5 pps
+		InErrors:   5,      // +3 errors
+		InDiscards: 3,      // +2 drops
 	}
 
 	delta := ComputeDelta("R1", "eth0", prev, curr)

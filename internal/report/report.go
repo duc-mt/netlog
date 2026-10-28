@@ -148,9 +148,9 @@ type Report struct {
 	// whether the problem was resolved (that is what Outages is for).
 	IncidentClosure IncidentClosure `json:"incident_closure"`
 
-	Outages                Outages          `json:"outages"`
-	DeviceHealth           DeviceHealth     `json:"device_health"`
-	ClassificationCoverage []VendorCoverage `json:"classification_coverage"`
+	Outages                Outages                    `json:"outages"`
+	DeviceHealth           DeviceHealth               `json:"device_health"`
+	ClassificationCoverage []VendorCoverage           `json:"classification_coverage"`
 	InterfaceDeltas        []collector.InterfaceDelta `json:"interface_deltas,omitempty"`
 
 	// Options is the (normalised) request the report answers. The table

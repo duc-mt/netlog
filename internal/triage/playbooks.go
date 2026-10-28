@@ -39,16 +39,16 @@ type step struct {
 
 // Platform families used as playbook table keys.
 const (
-	famVyOS    = "vyos"
-	famCisco   = "cisco"
-	famHuawei  = "huawei_vrp"
-	famJunos   = "juniper_junos"
-	famArista  = "arista"
-	famRuijie  = "ruijie"
-	famAruba   = "aruba"
-	famForti   = "fortigate"
+	famVyOS     = "vyos"
+	famCisco    = "cisco"
+	famHuawei   = "huawei_vrp"
+	famJunos    = "juniper_junos"
+	famArista   = "arista"
+	famRuijie   = "ruijie"
+	famAruba    = "aruba"
+	famForti    = "fortigate"
 	famMikroTik = "mikrotik"
-	famGeneric = "generic" // Linux / BSD-based platforms (Check Point Gaia, pfSense, VyOS fallback, Generic Linux)
+	famGeneric  = "generic" // Linux / BSD-based platforms (Check Point Gaia, pfSense, VyOS fallback, Generic Linux)
 )
 
 // family maps a canonical vendor key to its playbook family ("" = none).
@@ -193,10 +193,10 @@ var playbooks = map[string]map[string][]step{
 		famHuawei: {{"display cpu-usage", ""}},
 		famVyOS:   {{"show system processes", ""}},
 	},
-	pipeline.PlaybookOpticsAlarm:    opticsSteps,
-	pipeline.PlaybookBruteForce:     usersSteps,
-	pipeline.PlaybookConfigDiff:     configDiffSteps,
-	pipeline.PlaybookPacketCapture:  packetCaptureSteps,
+	pipeline.PlaybookOpticsAlarm:   opticsSteps,
+	pipeline.PlaybookBruteForce:    usersSteps,
+	pipeline.PlaybookConfigDiff:    configDiffSteps,
+	pipeline.PlaybookPacketCapture: packetCaptureSteps,
 }
 
 // vyosTypes maps interface name prefixes to the VyOS interface type keyword
