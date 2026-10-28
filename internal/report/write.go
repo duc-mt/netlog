@@ -28,6 +28,7 @@ import (
 	"strings"
 	"time"
 
+	"netlog/internal/collector"
 	"netlog/internal/query"
 )
 
@@ -95,6 +96,9 @@ func (r Report) normalized() Report {
 	if r.ClassificationCoverage == nil {
 		r.ClassificationCoverage = []VendorCoverage{}
 	}
+	if r.InterfaceDeltas == nil {
+		r.InterfaceDeltas = []collector.InterfaceDelta{}
+	}
 	if w := r.WeekOverWeek; w != nil && w.Categories == nil {
 		cp := *w
 		cp.Categories = []CategoryDelta{}
@@ -116,6 +120,9 @@ func WriteTable(w io.Writer, r Report, st query.Style) error {
 		writers = append(writers, writeDelta)
 	}
 	writers = append(writers, writeClosure, writeOutages, writeDeviceHealth, writeCoverage)
+	if len(r.InterfaceDeltas) > 0 {
+		writers = append(writers, writeInterfaceDeltas)
+	}
 
 	for i, write := range writers {
 		if i > 0 {
@@ -448,6 +455,48 @@ func writeCoverage(p *printer, r Report, st query.Style) {
 	grid(p, st, cols, rows, func(i int, line string) string {
 		if c := r.ClassificationCoverage[i]; c.Lines >= 20 && c.UnclassifiedPct >= 90 {
 			return st.Yellow(line) // the classifier understands almost nothing of this vendor
+		}
+		return line
+	})
+}
+
+// ---- 10. interface deltas (drops & traffic) --------------------------------
+
+func writeInterfaceDeltas(p *printer, r Report, st query.Style) {
+	heading(p, st, "Interface Drops & Errors (Diff Stats)")
+	if len(r.InterfaceDeltas) == 0 {
+		p.println(noData)
+		return
+	}
+	rows := make([][]string, len(r.InterfaceDeltas))
+	for i, d := range r.InterfaceDeltas {
+		inRate := fmt.Sprintf("%.1f kbps", d.InBps/1000.0)
+		outRate := fmt.Sprintf("%.1f kbps", d.OutBps/1000.0)
+		rows[i] = []string{
+			d.Device,
+			d.Interface,
+			inRate,
+			outRate,
+			itoa(int(d.InDropDiff)),
+			itoa(int(d.OutDropDiff)),
+			itoa(int(d.InErrorDiff)),
+			itoa(int(d.OutErrorDiff)),
+		}
+	}
+	cols := []column{
+		{"DEVICE", 20, false},
+		{"INTERFACE", 20, false},
+		{"IN RATE", 15, true},
+		{"OUT RATE", 15, true},
+		{"IN DROPS", 12, true},
+		{"OUT DROPS", 12, true},
+		{"IN ERRS", 12, true},
+		{"OUT ERRS", 12, true},
+	}
+	grid(p, st, cols, rows, func(i int, line string) string {
+		d := r.InterfaceDeltas[i]
+		if d.InDropDiff > 0 || d.OutDropDiff > 0 || d.InErrorDiff > 0 || d.OutErrorDiff > 0 {
+			return st.Red(line)
 		}
 		return line
 	})

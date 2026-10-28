@@ -43,9 +43,10 @@ import (
 const maxCommandLen = 200
 
 var (
-	allowedPrefix = regexp.MustCompile(`^(show |display |get |/log print|cat /proc/net/|execute log display)`)
+	allowedPrefix = regexp.MustCompile(`^(show |display |get |/log print|/tool sniffer quick|cat /proc/net/|execute log display|diagnose sniffer packet |tcpdump -c \d{1,2} |monitor traffic (?:interface \S+ )?count \d{1,2} no-resolve)`)
 
 	// Anything that could chain, redirect, substitute or break out of the line.
+	// Note: ' (single quote) is permitted only for sniffer filter string if no metachars are inside.
 	metaChars = regexp.MustCompile("[;&`$<>\\\\!{}\\x00-\\x1f\\x7f]")
 
 	// One pipe stage: a known filter plus at most one plain argument.

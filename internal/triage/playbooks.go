@@ -47,7 +47,8 @@ const (
 	famRuijie  = "ruijie"
 	famAruba   = "aruba"
 	famForti   = "fortigate"
-	famGeneric = "generic"
+	famMikroTik = "mikrotik"
+	famGeneric = "generic" // Linux / BSD-based platforms (Check Point Gaia, pfSense, VyOS fallback, Generic Linux)
 )
 
 // family maps a canonical vendor key to its playbook family ("" = none).
@@ -69,7 +70,9 @@ func family(vendorKey string) string {
 		return famAruba
 	case "fortigate":
 		return famForti
-	case "generic":
+	case "mikrotik":
+		return famMikroTik
+	case "checkpoint_gaia", "pfsense", "generic":
 		return famGeneric
 	}
 	return ""
@@ -162,6 +165,17 @@ var configDiffSteps = map[string][]step{
 	famArista: {{"show configuration diffs", "show session-config diff"}},
 }
 
+// packetCaptureSteps provide bounded, non-blocking on-demand packet captures.
+var packetCaptureSteps = map[string][]step{
+	famJunos:    {{"monitor traffic interface {iface} count 20 no-resolve", "monitor traffic count 20 no-resolve"}},
+	famForti:    {{"diagnose sniffer packet any none 4 20", ""}},
+	famMikroTik: {{"/tool sniffer quick interface={iface}", "/tool sniffer quick"}},
+	famCisco:    {{"show monitor capture buffer", "show ip traffic"}},
+	famHuawei:   {{"display packet-capture status", ""}},
+	famArista:   {{"show monitor capture", "tcpdump -c 20 -nn -i any"}},
+	famGeneric:  {{"tcpdump -c 20 -nn -i {iface}", "tcpdump -c 20 -nn -i any"}},
+}
+
 // playbooks maps playbook name -> platform family -> steps.
 var playbooks = map[string]map[string][]step{
 	pipeline.PlaybookLinkDown:    linkSteps,
@@ -179,9 +193,10 @@ var playbooks = map[string]map[string][]step{
 		famHuawei: {{"display cpu-usage", ""}},
 		famVyOS:   {{"show system processes", ""}},
 	},
-	pipeline.PlaybookOpticsAlarm: opticsSteps,
-	pipeline.PlaybookBruteForce:  usersSteps,
-	pipeline.PlaybookConfigDiff:  configDiffSteps,
+	pipeline.PlaybookOpticsAlarm:    opticsSteps,
+	pipeline.PlaybookBruteForce:     usersSteps,
+	pipeline.PlaybookConfigDiff:     configDiffSteps,
+	pipeline.PlaybookPacketCapture:  packetCaptureSteps,
 }
 
 // vyosTypes maps interface name prefixes to the VyOS interface type keyword
@@ -219,6 +234,10 @@ func Commands(vendorKey, playbook string, trigger collector.LogEntry) []string {
 		return nil
 	}
 	steps := byFamily[family(vendorKey)]
+	if len(steps) == 0 && playbook == pipeline.PlaybookPacketCapture {
+		// Fallback to generic Linux/BSD packet capture if vendor has no explicit steps
+		steps = byFamily[famGeneric]
+	}
 	if len(steps) == 0 {
 		return nil
 	}

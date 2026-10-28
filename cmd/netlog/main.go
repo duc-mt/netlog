@@ -37,6 +37,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1024,12 +1025,45 @@ func cmdReport(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "netlog report: warning: %v\n", err)
 	}
 
+	// Load interface counters snapshot if available
+	var ifaceDeltas []collector.InterfaceDelta
+	fc, err := store.LoadCounters(store.CountersPath(*dataDir))
+	if err == nil && fc != nil && len(fc.Devices) > 0 {
+		for dev, ifaces := range fc.Devices {
+			for name, cnt := range ifaces {
+				ifaceDeltas = append(ifaceDeltas, collector.InterfaceDelta{
+					Device:       dev,
+					Interface:    name,
+					DurationSec:  float64(time.Since(cnt.Timestamp).Seconds()),
+					InBps:        0,
+					OutBps:       0,
+					InErrorDiff:  cnt.InErrors,
+					OutErrorDiff: cnt.OutErrors,
+					InDropDiff:   cnt.InDiscards,
+					OutDropDiff:  cnt.OutDiscards,
+				})
+			}
+		}
+		sort.Slice(ifaceDeltas, func(i, j int) bool {
+			totI := ifaceDeltas[i].InDropDiff + ifaceDeltas[i].OutDropDiff + ifaceDeltas[i].InErrorDiff
+			totJ := ifaceDeltas[j].InDropDiff + ifaceDeltas[j].OutDropDiff + ifaceDeltas[j].InErrorDiff
+			if totI != totJ {
+				return totI > totJ
+			}
+			return ifaceDeltas[i].Device < ifaceDeltas[j].Device
+		})
+		if len(ifaceDeltas) > *top {
+			ifaceDeltas = ifaceDeltas[:*top]
+		}
+	}
+
 	// Stream the logs into the report: memory stays proportional to the
 	// number of devices and sources, not to the volume of history.
 	b := report.NewBuilder(report.Options{
 		Since: from, Until: now, Top: *top, Compare: doCompare,
-		Label:   strings.ToLower(strings.TrimSpace(*since)),
-		Devices: report.DeviceStatuses(health.All(), nil, now, store.DefaultStaleAfter, store.DefaultSilentAfter),
+		Label:           strings.ToLower(strings.TrimSpace(*since)),
+		Devices:         report.DeviceStatuses(health.All(), nil, now, store.DefaultStaleAfter, store.DefaultSilentAfter),
+		InterfaceDeltas: ifaceDeltas,
 	})
 	if err := query.Scan(*dataDir, query.Filter{Since: loadFrom, Until: now}, b.AddEntry); err != nil {
 		fmt.Fprintf(stderr, "netlog report: %v\n", err)

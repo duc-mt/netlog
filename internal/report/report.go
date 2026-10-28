@@ -122,6 +122,9 @@ type Options struct {
 	// from DeviceStatuses. It is a snapshot of now, not of the window, and is
 	// optional: without it the Device Health section is empty.
 	Devices []DeviceStatus
+
+	// InterfaceDeltas provides interface rate and drop metrics across the fleet.
+	InterfaceDeltas []collector.InterfaceDelta
 }
 
 func (o Options) top() int {
@@ -148,6 +151,7 @@ type Report struct {
 	Outages                Outages          `json:"outages"`
 	DeviceHealth           DeviceHealth     `json:"device_health"`
 	ClassificationCoverage []VendorCoverage `json:"classification_coverage"`
+	InterfaceDeltas        []collector.InterfaceDelta `json:"interface_deltas,omitempty"`
 
 	// Options is the (normalised) request the report answers. The table
 	// writer needs it for headings; it is not part of the JSON output.
@@ -561,6 +565,7 @@ func (b *Builder) Build() Report {
 		Outages:                b.outages(),
 		DeviceHealth:           buildDeviceHealth(b.opts.Devices),
 		ClassificationCoverage: b.classificationCoverage(),
+		InterfaceDeltas:        b.opts.InterfaceDeltas,
 		Options:                b.opts,
 	}
 }

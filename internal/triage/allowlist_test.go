@@ -43,6 +43,9 @@ func TestAllowlistAccepts(t *testing.T) {
 		"show system commit diff 0", "show system rollback compare 0 1",
 		"show configuration commit changes last 1", "display configuration commit changes last 1",
 		"show archive log config all", "show configuration diffs", "show session-config diff",
+		"diagnose sniffer packet any none 4 20", "tcpdump -c 20 -nn -i eth0", "tcpdump -c 5 -nn -i any",
+		"monitor traffic count 20 no-resolve", "monitor traffic interface ge-0/0/0 count 20 no-resolve",
+		"/tool sniffer quick", "/tool sniffer quick interface=ether1", "show monitor capture",
 	} {
 		if err := Check(cmd); err != nil {
 			t.Errorf("Check(%q) = %v, want nil", cmd, err)
@@ -72,6 +75,9 @@ func TestAllowlistRejects(t *testing.T) {
 		"copy running-config startup-config": "not allowlisted prefix",
 		"show copy":                          "blocked word copy",
 		"format flash:":                      "not allowlisted prefix",
+		"tcpdump -i any":                     "missing bounded -c count",
+		"tcpdump -c 200 -i any":              "exceeds bounded 2 digits count",
+		"diagnose sys admin":                 "blocked prefix",
 		"show format":                        "blocked word format",
 		"debug ip packet":                    "not allowlisted prefix",
 		"show debug ip packet":               "blocked phrase",

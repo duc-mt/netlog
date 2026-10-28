@@ -58,6 +58,7 @@ const (
 	PlaybookOpticsAlarm    = "optics_alarm"
 	PlaybookBruteForce     = "brute_force"
 	PlaybookConfigDiff     = "config_diff"
+	PlaybookPacketCapture  = "packet_capture"
 )
 
 // Signal priorities.
