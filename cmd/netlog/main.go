@@ -374,6 +374,7 @@ type app struct {
 	writer     *store.JSONLWriter
 	engine     *triage.Engine
 	telegram   *notifier.TelegramNotifier
+	counters   *store.FleetCounters
 
 	loc *time.Location
 
@@ -502,6 +503,11 @@ func newApp(o collectOpts, log *stderrLogger) (*app, error) {
 		det.Prime(recent)
 	}
 
+	counters, err := store.LoadCounters(store.CountersPath(o.dataDir))
+	if err != nil {
+		log.Warn("loading counters: %v", err)
+	}
+
 	return &app{
 		opts:      o,
 		log:       log,
@@ -518,6 +524,7 @@ func newApp(o collectOpts, log *stderrLogger) (*app, error) {
 		writer:   writer,
 		engine:   engine,
 		telegram: tg,
+		counters: counters,
 		loc:      time.Local,
 		warnedAt: make(map[string]time.Time),
 		failing:  make(map[string]string),
@@ -556,6 +563,11 @@ func (a *app) close() {
 	a.engine.Close()
 	if err := a.marks.Save(); err != nil {
 		a.log.Warn("saving watermarks: %v", err)
+	}
+	if a.counters != nil {
+		if err := store.SaveCounters(store.CountersPath(a.opts.dataDir), a.counters); err != nil {
+			a.log.Warn("saving counters: %v", err)
+		}
 	}
 	_ = a.writer.Close()
 	a.unlock()

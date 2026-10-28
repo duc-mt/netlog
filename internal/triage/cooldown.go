@@ -47,6 +47,7 @@ var cooldowns = map[string]time.Duration{
 	"PASSWORD_SPRAY_ATTEMPT": 15 * time.Minute,
 	"CONFIG_CHANGE":          2 * time.Minute,
 	"AFTER_HOURS_CHANGE":     2 * time.Minute,
+	"PACKET_CAPTURE":         5 * time.Minute,
 }
 
 // CooldownFor returns the cooldown period for an event type.
