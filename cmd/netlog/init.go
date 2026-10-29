@@ -75,6 +75,7 @@ const sampleInventory = `hostname,address,port,vendor,credential_group,jump_host
 #   vyos, cisco_ios (cisco, ios-xe), cisco_asa (asa, ftd), cisco_sb (sg350, cbs350),
 #   huawei_vrp (huawei, h3c, comware), juniper_junos (junos), fortigate (fortios),
 #   aruba (aos-cx), ruijie (rgos), mikrotik (RouterOS), arista (eos),
+#   cumulus (Cumulus Linux; the login needs read access to /var/log/syslog),
 #   paloalto (pan-os), pfsense (2.5+, needs shell access), checkpoint_gaia
 #   (the login's shell must be /bin/bash), generic
 # sophos is recognised but not supported yet: such devices are skipped with one

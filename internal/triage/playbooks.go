@@ -39,16 +39,19 @@ type step struct {
 
 // Platform families used as playbook table keys.
 const (
-	famVyOS     = "vyos"
-	famCisco    = "cisco"
-	famHuawei   = "huawei_vrp"
-	famJunos    = "juniper_junos"
-	famArista   = "arista"
-	famRuijie   = "ruijie"
-	famAruba    = "aruba"
-	famForti    = "fortigate"
+	famVyOS    = "vyos"
+	famCisco   = "cisco"
+	famHuawei  = "huawei_vrp"
+	famJunos   = "juniper_junos"
+	famArista  = "arista"
+	famRuijie  = "ruijie"
+	famAruba   = "aruba"
+	famForti   = "fortigate"
+	famGeneric = "generic"
+
+	famCumulus  = "cumulus"
 	famMikroTik = "mikrotik"
-	famGeneric  = "generic" // Linux / BSD-based platforms (Check Point Gaia, pfSense, VyOS fallback, Generic Linux)
+	famPaloAlto = "paloalto"
 )
 
 // family maps a canonical vendor key to its playbook family ("" = none).
@@ -70,9 +73,13 @@ func family(vendorKey string) string {
 		return famAruba
 	case "fortigate":
 		return famForti
+	case "cumulus":
+		return famCumulus
 	case "mikrotik":
 		return famMikroTik
-	case "checkpoint_gaia", "pfsense", "generic":
+	case "paloalto":
+		return famPaloAlto
+	case "generic":
 		return famGeneric
 	}
 	return ""
@@ -115,6 +122,15 @@ var linkSteps = map[string][]step{
 	famGeneric: {
 		{"show interfaces {iface}", "show interfaces"},
 	},
+	famCumulus: {
+		{"ip -s link show dev {iface}", "ip -s link show"},
+	},
+	famMikroTik: {
+		{"/interface print stats", ""},
+	},
+	famPaloAlto: {
+		{"show interface all", ""},
+	},
 }
 
 // opticsSteps run on a transceiver / DDM alarm: optical Rx/Tx power first,
@@ -138,6 +154,8 @@ var ospfSteps = map[string][]step{
 	famRuijie: {{"show ip ospf neighbor", ""}, {"show ip ospf interface {iface}", "show ip ospf interface"}},
 	famAruba:  {{"show ip ospf neighbor", ""}, {"show ip ospf interface {iface}", "show ip ospf interface"}},
 	famForti:  {{"get router info ospf neighbor", ""}, {"get router info ospf interface", ""}},
+
+	famPaloAlto: {{"show routing route", ""}},
 }
 
 var bgpSteps = map[string][]step{
@@ -149,6 +167,9 @@ var bgpSteps = map[string][]step{
 	famRuijie: {{"show ip bgp summary", ""}, {"show ip bgp neighbors {peer}", ""}},
 	famAruba:  {{"show bgp summary", ""}, {"show bgp neighbor {peer}", ""}},
 	famForti:  {{"get router info bgp summary", ""}, {"get router info bgp neighbors {peer}", ""}},
+
+	famCumulus:  {{"vtysh -c 'show ip bgp summary'", ""}},
+	famPaloAlto: {{"show routing route", ""}},
 }
 
 var usersSteps = map[string][]step{
@@ -157,12 +178,14 @@ var usersSteps = map[string][]step{
 	famHuawei: {{"display users online", ""}},
 }
 
+// configDiffSteps compare the running configuration with the last saved or
+// committed one. They are read-only comparisons: nothing is saved, committed
+// or rolled back. A family with no entry gets no config-diff capture.
 var configDiffSteps = map[string][]step{
-	famVyOS:   {{"show system commit diff 0", ""}},
+	famCisco:  {{"show archive config differences nvram:startup-config system:running-config", ""}},
 	famJunos:  {{"show system rollback compare 0 1", ""}},
-	famCisco:  {{"show configuration commit changes last 1", "show archive log config all"}},
-	famHuawei: {{"display configuration commit changes last 1", ""}},
-	famArista: {{"show configuration diffs", "show session-config diff"}},
+	famArista: {{"show diff rollback-patch", ""}},
+	famHuawei: {{"display configuration changes system-committed", ""}},
 }
 
 // packetCaptureSteps provide bounded, non-blocking on-demand packet captures.
@@ -189,13 +212,15 @@ var playbooks = map[string]map[string][]step{
 		famCisco: {{"show spanning-tree detail", ""}},
 	},
 	pipeline.PlaybookHighCPU: {
-		famCisco:  {{"show processes cpu sorted | head 15", ""}},
-		famHuawei: {{"display cpu-usage", ""}},
-		famVyOS:   {{"show system processes", ""}},
+		famCisco:    {{"show processes cpu sorted | head 15", ""}},
+		famHuawei:   {{"display cpu-usage", ""}},
+		famVyOS:     {{"show system processes", ""}},
+		famMikroTik: {{"/system resource print", ""}},
+		famPaloAlto: {{"show system info", ""}},
 	},
+	pipeline.PlaybookConfigChange:  configDiffSteps,
 	pipeline.PlaybookOpticsAlarm:   opticsSteps,
 	pipeline.PlaybookBruteForce:    usersSteps,
-	pipeline.PlaybookConfigDiff:    configDiffSteps,
 	pipeline.PlaybookPacketCapture: packetCaptureSteps,
 }
 

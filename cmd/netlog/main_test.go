@@ -188,7 +188,12 @@ func (e env) run(t *testing.T, args ...string) (stdout, stderr string, code int)
 }
 
 func (e env) collect(t *testing.T) (string, int) {
-	_, stderr, code := e.run(t, append([]string{"collect"}, e.args...)...)
+	return e.collectWith(t)
+}
+
+// collectWith runs one collect pass with extra flags.
+func (e env) collectWith(t *testing.T, extra ...string) (string, int) {
+	_, stderr, code := e.run(t, append(append([]string{"collect"}, extra...), e.args...)...)
 	return stderr, code
 }
 
@@ -219,6 +224,28 @@ func (e env) incidents(t *testing.T) []collector.IncidentReport {
 		t.Fatal(err)
 	}
 	return rs
+}
+
+// --no-config-diff restores the previous behaviour: configuration changes are
+// logged but never open an SSH session of their own.
+func TestCollectNoConfigDiffFlag(t *testing.T) {
+	dev, host, port := startFakeIOS(t)
+	e := newEnv(t, fmt.Sprintf("SW-LAB,%s,%d,cisco_ios,default,\n", host, port))
+	if stderr, code := e.collectWith(t, "--no-config-diff"); code != 0 {
+		t.Fatalf("exit %d\n%s", code, stderr)
+	}
+	incs := e.incidents(t)
+	if len(incs) != 2 { // OSPF down + link down only
+		t.Fatalf("want 2 incidents, got %d", len(incs))
+	}
+	for _, inc := range incs {
+		if inc.Playbook == "config_change" || inc.ConfigDiff != "" {
+			t.Errorf("config diff captured despite --no-config-diff: %+v", inc)
+		}
+	}
+	if n := dev.count("show archive config differences nvram:startup-config system:running-config"); n != 0 {
+		t.Errorf("the comparison ran %d time(s) with --no-config-diff", n)
+	}
 }
 
 func TestCollectEndToEnd(t *testing.T) {
@@ -259,8 +286,18 @@ func TestCollectEndToEnd(t *testing.T) {
 	if d := time.Since(tanvt.Timestamp); d < 4*time.Minute || d > 6*time.Minute {
 		t.Errorf("corrected timestamp is %v old, want about 5m (event was 5m before the fake's 'now')", d)
 	}
-	if n := len(e.incidents(t)); n != 3 { // OSPF down + link down + config diff; the evil config line is suppressed by cooldown
-		t.Fatalf("want 3 incidents (ospf_adj_down, link_down, config_diff), got %d\n%s", n, stderr)
+	// OSPF down + link down + one config_change capture (the second config line,
+	// "evil", is inside the 5 minute cooldown of the first and is not a fault).
+	playbooks := map[string]collector.IncidentReport{}
+	for _, inc := range e.incidents(t) {
+		playbooks[inc.Playbook] = inc
+	}
+	if len(e.incidents(t)) != 3 || playbooks["ospf_adj_down"].ID == "" || playbooks["link_down"].ID == "" || playbooks["config_change"].ID == "" {
+		t.Fatalf("want 3 incidents (ospf_adj_down, link_down, config_change), got %+v\n%s", playbooks, stderr)
+	}
+	const diffCmd = "show archive config differences nvram:startup-config system:running-config"
+	if got := playbooks["config_change"]; got.ConfigDiff != "output of ["+diffCmd+"]\n" || dev.count(diffCmd) != 1 {
+		t.Errorf("config diff capture: ConfigDiff=%q, device ran the comparison %d time(s)", got.ConfigDiff, dev.count(diffCmd))
 	}
 	if dev.count("show ip ospf neighbor") != 1 {
 		t.Errorf("ospf playbook should have run once, ran %d times", dev.count("show ip ospf neighbor"))
@@ -306,7 +343,7 @@ func TestCollectEndToEnd(t *testing.T) {
 		t.Errorf("timeline should attribute the OSPF fault to tanvt's change:\n%s", out)
 	}
 	out, _, code = e.run(t, "incidents", "--data-dir", filepath.Join(e.dir, "data"), "--since", "1h", "--no-color")
-	if code != 0 || !strings.Contains(out, "ospf_adj_down") || !strings.Contains(out, "link_down") || !strings.Contains(out, "config_diff") {
+	if code != 0 || !strings.Contains(out, "ospf_adj_down") || !strings.Contains(out, "link_down") || !strings.Contains(out, "config_change") {
 		t.Errorf("incidents list:\n%s", out)
 	}
 	id := e.incidents(t)[0].ID
@@ -655,7 +692,9 @@ func TestReportEndToEnd(t *testing.T) {
 	}
 
 	// ---- real collection (SW-LAB: 2 faults, 2 config changes, 2 incidents), plus older days ----
-	if stderr, code := e.collect(t); code != 0 {
+	// --no-config-diff: this test checks report arithmetic over a known set of
+	// incidents; config-diff captures have their own tests.
+	if stderr, code := e.collectWith(t, "--no-config-diff"); code != 0 {
 		t.Fatalf("collect: exit %d\n%s", code, stderr)
 	}
 	seedReportHistory(t, dataDir)
@@ -722,10 +761,10 @@ func TestReportEndToEnd(t *testing.T) {
 	match(delta, `TOTAL\s*│\s*4\s*│\s*14\s*│\s*\+10\s*│\s*\+250\.0%`)
 
 	closure := reportSection(t, out, "Triage Reach")
-	match(closure, `Incidents:\s+6`)
-	match(closure, `All diagnostics succeeded:\s+3 \(50\.0%\)`)
-	match(closure, `Unreachable during triage:\s+2 \(33\.3%\)`)
-	match(closure, `Some commands failed:\s+1 \(16\.7%\)`)
+	match(closure, `Incidents:\s+5`)
+	match(closure, `All diagnostics succeeded:\s+2 \(40\.0%\)`)
+	match(closure, `Unreachable during triage:\s+2 \(40\.0%\)`)
+	match(closure, `Some commands failed:\s+1 \(20\.0%\)`)
 	match(closure, `SW-GONE\s*│\s*2\s*│\s*2\s*│\s*yes`)
 
 	// The collection that just ran left a health record: SW-LAB is fine, so
@@ -768,7 +807,7 @@ func TestReportEndToEnd(t *testing.T) {
 		w.Categories[3].ChangePct != nil || w.Total.Current != 14 || w.Total.Previous != 4 {
 		t.Errorf("week_over_week = %+v", w)
 	}
-	if ic := rep.IncidentClosure; ic.Total != 6 || ic.Succeeded != 3 || ic.Unreachable != 2 || ic.PartialFailure != 1 ||
+	if ic := rep.IncidentClosure; ic.Total != 5 || ic.Succeeded != 2 || ic.Unreachable != 2 || ic.PartialFailure != 1 ||
 		len(ic.UnreachableHosts) != 1 || ic.UnreachableHosts[0] != (report.UnreachableHost{Hostname: "SW-GONE", Unreachable: 2, Incidents: 2, Always: true}) {
 		t.Errorf("incident_closure = %+v", ic)
 	}
@@ -1096,5 +1135,204 @@ func TestDiagnoseUsage(t *testing.T) {
 	}
 	if code := run([]string{"diagnose", "--interface", "Gi0/1;x", "r1"}, &out, &errb); code != exitUsage {
 		t.Errorf("bad interface: code %d, want %d", code, exitUsage)
+	}
+}
+
+// ---- netlog listen -----------------------------------------------------------------------
+
+func TestResolveListenAddrs(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		bind         string
+		port         int
+		proto        string
+		udp, tcp     int
+		wantU, wantT string
+		wantErr      bool
+	}{
+		{"defaults", "", 514, "udp,tcp", 0, 0, ":514", ":514", false},
+		{"udp only", "", 5514, "udp", 0, 0, ":5514", "", false},
+		{"tcp only, bound", "10.0.0.5", 601, "tcp", 0, 0, "", "10.0.0.5:601", false},
+		{"per-protocol override", "", 514, "udp,tcp", 5514, 0, ":5514", ":514", false},
+		{"both overrides", "127.0.0.1", 514, "UDP, tcp", 1514, 2514, "127.0.0.1:1514", "127.0.0.1:2514", false},
+		{"override of a disabled protocol is ignored", "", 514, "udp", 0, 9999, ":514", "", false},
+		{"ipv6 bind", "::1", 514, "udp", 0, 0, "[::1]:514", "", false},
+		{"unknown protocol", "", 514, "udp,sctp", 0, 0, "", "", true},
+		{"no protocol", "", 514, " , ", 0, 0, "", "", true},
+		{"port 0", "", 0, "udp", 0, 0, "", "", true},
+		{"port too large", "", 70000, "udp", 0, 0, "", "", true},
+		{"bad override", "", 514, "udp", 70000, 0, "", "", true},
+	} {
+		got, err := resolveListenAddrs(tc.bind, tc.port, tc.proto, tc.udp, tc.tcp)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("%s: err = %v", tc.name, err)
+			continue
+		}
+		if err == nil && (got.udpAddr != tc.wantU || got.tcpAddr != tc.wantT) {
+			t.Errorf("%s: got %q / %q, want %q / %q", tc.name, got.udpAddr, got.tcpAddr, tc.wantU, tc.wantT)
+		}
+	}
+}
+
+func TestListenUsageAndStartupErrors(t *testing.T) {
+	var out, errb bytes.Buffer
+	if code := run([]string{"listen", "-h"}, &out, &errb); code != exitOK || !strings.Contains(errb.String(), "--accept-unknown") {
+		t.Errorf("-h: code %d, stderr %q", code, errb.String())
+	}
+	errb.Reset()
+	if code := run([]string{"listen", "--proto", "sctp"}, &out, &errb); code != exitUsage || !strings.Contains(errb.String(), "unknown protocol") {
+		t.Errorf("bad proto: code %d, stderr %q", code, errb.String())
+	}
+	errb.Reset()
+	if code := run([]string{"listen", "extra"}, &out, &errb); code != exitUsage {
+		t.Errorf("stray argument: code %d", code)
+	}
+	// An empty inventory would drop every sender: refuse to start.
+	dir := t.TempDir()
+	empty := filepath.Join(dir, "inv.csv")
+	if err := os.WriteFile(empty, []byte("hostname,address,port,vendor,credential_group,jump_host\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	errb.Reset()
+	if code := run([]string{"listen", "--inventory", empty, "--data-dir", filepath.Join(dir, "d"), "--port", "0"}, &out, &errb); code != exitUsage {
+		t.Errorf("port 0 is invalid: code %d", code)
+	}
+	errb.Reset()
+	if code := run([]string{"listen", "--inventory", empty, "--data-dir", filepath.Join(dir, "d"), "--port", "25999"}, &out, &errb); code != exitError || !strings.Contains(errb.String(), "no devices") {
+		t.Errorf("empty inventory: code %d, stderr %q", code, errb.String())
+	}
+}
+
+func TestListenerLockIsSeparateFromTheCollectorLock(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no data-directory lock on Windows")
+	}
+	dir := t.TempDir()
+	relCollector, err := lockDataDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A collect/monitor run holds its lock; a listener still starts beside it.
+	relListener, err := lockListener(dir)
+	if err != nil {
+		t.Fatalf("listener must not be blocked by the collector lock: %v", err)
+	}
+	// Two listeners on one data directory are refused.
+	if _, err := lockListener(dir); !errors.Is(err, errAlreadyRunning) {
+		t.Fatalf("second listener must be refused, got %v", err)
+	}
+	// And a collector still cannot start twice.
+	if _, err := lockDataDir(dir); !errors.Is(err, errAlreadyRunning) {
+		t.Fatalf("second collector must be refused, got %v", err)
+	}
+	relListener()
+	relCollector()
+	if rel, err := lockListener(dir); err != nil {
+		t.Fatalf("listener lock must be released: %v", err)
+	} else {
+		rel()
+	}
+}
+
+// ---- netlog top / monitor --tui ---------------------------------------------------------
+
+func TestTopFlagsAndNonInteractiveRefusal(t *testing.T) {
+	var out, errb bytes.Buffer
+	if code := run([]string{"top", "-h"}, &out, &errb); code != exitOK || !strings.Contains(errb.String(), "Ctrl+C") || !strings.Contains(errb.String(), "-refresh") {
+		t.Errorf("-h: code %d, stderr %q", code, errb.String())
+	}
+	for name, args := range map[string][]string{
+		"refresh too fast": {"top", "--refresh", "10ms"},
+		"stray argument":   {"top", "now"},
+		"bad stale":        {"top", "--stale-after", "0s"},
+		"unknown flag":     {"top", "--bogus"},
+	} {
+		errb.Reset()
+		if code := run(args, &out, &errb); code != exitUsage {
+			t.Errorf("%s: code %d, stderr %q", name, code, errb.String())
+		}
+	}
+	// Under "go test" stdin/stdout are not a terminal: refuse with a pointer to
+	// the scriptable commands instead of writing escape codes into a pipe.
+	errb.Reset()
+	if code := run([]string{"top", "--data-dir", t.TempDir()}, &out, &errb); code != exitError || !strings.Contains(errb.String(), "interactive terminal") {
+		t.Errorf("non-tty: code %d, stderr %q", code, errb.String())
+	}
+	if out.Len() != 0 {
+		t.Errorf("escape sequences written to a non-terminal: %q", out.String())
+	}
+	errb.Reset()
+	if code := run([]string{"monitor", "--tui", "--data-dir", t.TempDir(), "--inventory", "none.csv"}, &out, &errb); code != exitError || !strings.Contains(errb.String(), "--tui needs an interactive terminal") {
+		t.Errorf("monitor --tui on a non-tty: code %d, stderr %q", code, errb.String())
+	}
+	errb.Reset()
+	if code := run([]string{"collect", "--tui"}, &out, &errb); code != exitUsage {
+		t.Errorf("--tui is a monitor flag only: code %d", code)
+	}
+}
+
+// ---- netlog diagnose: probe and JSON -----------------------------------------------------
+
+func TestDiagnoseProbeAndJSONFlags(t *testing.T) {
+	_, host, port := startFakeIOS(t)
+	e := newEnv(t, fmt.Sprintf("SW-LAB,%s,%d,cisco_ios,default,\n", host, port))
+	args := func(extra ...string) []string {
+		// diagnose has no --data-dir; the flag package stops at the first
+		// positional argument, so the device comes last.
+		a := []string{"diagnose"}
+		a = append(a, extra...)
+		for i := 0; i < len(e.args); i++ {
+			if e.args[i] == "--data-dir" {
+				i++ // skip its value
+				continue
+			}
+			a = append(a, e.args[i])
+		}
+		return append(a, "SW-LAB")
+	}
+
+	// Default: the probe section is shown, first, in the text report.
+	out, stderr, code := e.run(t, args("--no-color")...)
+	if code != 0 && code != exitError {
+		t.Fatalf("diagnose: code %d\n%s", code, stderr)
+	}
+	iProbe, iSSH := strings.Index(out, "Path & Reachability Probe"), strings.Index(out, "SSH connect")
+	if iProbe < 0 || iSSH < 0 || iProbe > iSSH || !strings.Contains(out, "TCP 127.0.0.1:") {
+		t.Errorf("text report should start with the probe:\n%s", out)
+	}
+	// The fake Cisco answers "show power inline" with junk; the PoE section is present.
+	if !strings.Contains(out, "PoE power budget") {
+		t.Errorf("a Cisco switch gets a PoE section:\n%s", out)
+	}
+
+	// --no-probe drops it.
+	out, _, _ = e.run(t, args("--no-color", "--no-probe")...)
+	if strings.Contains(out, "Path & Reachability Probe") {
+		t.Errorf("--no-probe still probed:\n%s", out)
+	}
+
+	// --json: one valid JSON document with probe/poe/sections, nothing else on stdout.
+	out, stderr, _ = e.run(t, args("--json")...)
+	var rep struct {
+		Hostname string                         `json:"hostname"`
+		Vendor   string                         `json:"vendor"`
+		Healthy  bool                           `json:"healthy"`
+		Probe    *struct{ Name, Status string } `json:"probe"`
+		PoE      *struct{ Name string }         `json:"poe"`
+		Sections []struct{ Name string }        `json:"sections"`
+	}
+	if err := json.Unmarshal([]byte(out), &rep); err != nil {
+		t.Fatalf("--json output is not JSON: %v\n%s\nstderr: %s", err, out, stderr)
+	}
+	if rep.Hostname != "SW-LAB" || rep.Vendor != "cisco_ios" || rep.Probe == nil || rep.Probe.Name != "Path & Reachability Probe" ||
+		rep.PoE == nil || len(rep.Sections) == 0 {
+		t.Errorf("JSON report: %+v\n%s", rep, out)
+	}
+	if strings.Contains(out, "\x1b") || strings.Contains(out, "password") {
+		t.Errorf("JSON must be plain and free of secrets:\n%s", out)
+	}
+	out, _, _ = e.run(t, args("--json", "--no-probe")...)
+	if strings.Contains(out, `"probe"`) {
+		t.Errorf("--json --no-probe still carries a probe:\n%s", out)
 	}
 }

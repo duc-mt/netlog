@@ -198,11 +198,6 @@ func TestPlaybookCommands(t *testing.T) {
 		{"brute vyos", "vyos", "brute_force", "x", "show users"},
 		{"brute huawei", "huawei_vrp", "brute_force", "x", "display users online"},
 		{"junos link: fallback", "juniper_junos", "link_down", "x", "show interfaces terse"},
-		{"config_diff vyos", "vyos", "config_diff", "x", "show system commit diff 0"},
-		{"config_diff junos", "juniper_junos", "config_diff", "x", "show system rollback compare 0 1"},
-		{"config_diff cisco", "cisco_ios", "config_diff", "x", "show configuration commit changes last 1"},
-		{"config_diff huawei", "huawei_vrp", "config_diff", "x", "display configuration commit changes last 1"},
-		{"config_diff arista", "arista", "config_diff", "x", "show configuration diffs"},
 		{"mikrotik: no playbook", "mikrotik", "ospf_adj_down", "x", ""},
 		{"fortigate link: fallback", "fortigate", "link_down", "x", "get system interface physical"},
 		{"unknown playbook", "cisco_ios", "nope", "x", ""},
@@ -532,9 +527,10 @@ func TestEngineNoPlaybookOrBlockedCommandOpensNoSession(t *testing.T) {
 	fd, host, port := startFakeDevice(t, func(string) string { return "ok\n" })
 	eng, dir, _ := newEngine(t)
 
-	// MikroTik has no playbook: nothing happens.
-	mt := inventory.Device{Hostname: "R1", Address: host, Port: port, Vendor: "mikrotik", CredentialGroup: "default"}
-	eng.Handle(context.Background(), signal("LINK_DOWN", pipeline.PlaybookLinkDown, "ether1 link down"), mt)
+	// pfSense has no triage playbook: nothing happens. (MikroTik used to be
+	// the example here; it now has link and CPU playbooks.)
+	mt := inventory.Device{Hostname: "R1", Address: host, Port: port, Vendor: "pfsense", CredentialGroup: "default"}
+	eng.Handle(context.Background(), signal("LINK_DOWN", pipeline.PlaybookLinkDown, "igb1 link down"), mt)
 
 	// An unknown playbook name: nothing happens.
 	cs := inventory.Device{Hostname: "R1", Address: host, Port: port, Vendor: "cisco_ios", CredentialGroup: "default"}
@@ -636,8 +632,27 @@ func FuzzCheck(f *testing.F) {
 	} {
 		f.Add(s)
 	}
+	for _, s := range newCommands { // the anchored exact commands and lookalikes of them
+		f.Add(s)
+		f.Add(s + "; reload")
+		f.Add(s + " | tftp 1.1.1.1")
+		f.Add(s + "\nreload")
+	}
 	f.Fuzz(func(t *testing.T, cmd string) {
 		if Check(cmd) != nil {
+			return
+		}
+		// A command admitted by an anchored exact pattern skips the prefix and
+		// word rules by design, but never the size, character and pipe rules.
+		if matchesExact(cmd) {
+			if len(cmd) > 200 || strings.Contains(cmd, "|") {
+				t.Fatalf("exact pattern admitted %q: too long or piped", cmd)
+			}
+			for _, r := range cmd {
+				if r < 0x20 || r == 0x7f || strings.ContainsRune(";&`$<>\\!{}", r) {
+					t.Fatalf("exact pattern admitted %q containing %q", cmd, r)
+				}
+			}
 			return
 		}
 		lower := strings.ToLower(cmd)
@@ -673,4 +688,162 @@ func FuzzCheck(f *testing.F) {
 			}
 		}
 	})
+}
+
+// ---- GATE 1: exact-pattern commands (diff, topology, PoE, new vendors) -----------------
+
+// newCommands is every command the new features send. Each must match an
+// anchored exact pattern, so the generic prefix/denylist rules can never be
+// what admits it.
+var newCommands = []string{
+	"show archive config differences nvram:startup-config system:running-config",
+	"show system rollback compare 0 1",
+	"show diff rollback-patch",
+	"display configuration changes system-committed",
+	"show cdp neighbors detail",
+	"show lldp neighbors detail",
+	"show lldp info remote-device",
+	"display lldp neighbor-information verbose",
+	"show power inline",
+	"show power-over-ethernet",
+	"display poe power-state",
+	"show system info",
+	"show routing route",
+	"show interface all",
+	"ip -s link show",
+	"ip -s link show dev swp1",
+	"vtysh -c 'show ip bgp summary'",
+	"/system resource print",
+	"/interface print stats",
+}
+
+func TestNewCommandsMatchExactAllowlist(t *testing.T) {
+	for _, cmd := range newCommands {
+		if !matchesExact(cmd) {
+			t.Errorf("%q does not match an exact pattern", cmd)
+		}
+		if err := Check(cmd); err != nil {
+			t.Errorf("Check(%q) = %v, want nil", cmd, err)
+		}
+	}
+	for _, re := range exactAllowed {
+		s := re.String()
+		if !strings.HasPrefix(s, "^") || !strings.HasSuffix(s, "$") {
+			t.Errorf("exact pattern %q is not anchored with ^...$", s)
+		}
+		if strings.Contains(s, "|") {
+			t.Errorf("exact pattern %q contains an alternation; list each command separately", s)
+		}
+	}
+}
+
+// Every command a playbook, the diff table or the topology table can produce
+// is registered in the exact list or passes the generic rules, and the tables
+// the spec adds are reachable.
+func TestTopologyAndDiffCommandsPassGate1(t *testing.T) {
+	for fam, steps := range configDiffSteps {
+		for _, s := range steps {
+			if err := Check(s.tmpl); err != nil {
+				t.Errorf("config diff %s: %v", fam, err)
+			}
+			if !matchesExact(s.tmpl) {
+				t.Errorf("config diff %s: %q is not registered as an exact command", fam, s.tmpl)
+			}
+		}
+	}
+	for fam, cmds := range topologyCommands {
+		for _, c := range cmds {
+			if err := Check(c); err != nil {
+				t.Errorf("topology %s: %v", fam, err)
+			}
+			if !matchesExact(c) {
+				t.Errorf("topology %s: %q is not registered as an exact command", fam, c)
+			}
+		}
+	}
+}
+
+func TestExactAllowlistRejectsLookalikes(t *testing.T) {
+	for _, cmd := range []string{
+		"show archive config differences nvram:startup-config system:running-config ",
+		"show archive config differences nvram:startup-config system:running-config | include a",
+		"show archive config differences nvram:startup-config system:running-config; reload",
+		"show archive config differences",
+		"show archive config replace",
+		"configure replace flash:x",
+		"show system rollback compare 0 1 | tftp 1.1.1.1",
+		"rollback 1",
+		"ip -s link show; ip link set swp1 down",
+		"ip link set swp1 down",
+		"ip -s link show dev swp1 && reboot",
+		"ip -s link show dev 1swp",
+		"ip -s link show dev " + strings.Repeat("a", 40),
+		"ip -s link show dev swp1 swp2",
+		"ip addr add 1.1.1.1/32 dev lo",
+		"vtysh -c 'show ip bgp summary' -c 'configure terminal'",
+		"vtysh -c 'configure terminal'",
+		"vtysh -c \"show ip bgp summary\"",
+		"vtysh",
+		"/system resource print; /system reboot",
+		"/system reboot",
+		"/system resource print\n/system reboot",
+		"/interface print stats where name=ether1",
+		"/interface set ether1 disabled=yes",
+		"/system resource",
+		"show system info\nreload",
+		"display poe power-state | redirect flash:x",
+		"show power inline | tftp 1.2.3.4",
+	} {
+		if err := Check(cmd); err == nil {
+			t.Errorf("Check(%q) = nil, want rejection", cmd)
+		}
+	}
+}
+
+// A hostile interface name taken from a log line (or from a neighbour's LLDP
+// advertisement) must not be able to turn the Cumulus template into anything
+// but "ip -s link show [dev NAME]".
+func TestCumulusInterfaceCannotSmuggleCommands(t *testing.T) {
+	for _, raw := range []string{
+		"Interface swp1;reboot, changed state to down",
+		"Interface swp1$(reboot), changed state to down",
+		"Interface swp1`reboot` changed state to down",
+		"Interface swp1 && ip link set swp2 down",
+		"Interface swp1\nip link set swp2 down",
+	} {
+		for _, cmd := range Commands("cumulus", pipeline.PlaybookLinkDown, collector.LogEntry{Raw: raw}) {
+			if err := Check(cmd); err != nil {
+				t.Errorf("hostile %q produced unsafe command: %v", raw, err)
+			}
+		}
+	}
+}
+
+func TestNewVendorPlaybooks(t *testing.T) {
+	tests := []struct {
+		name, key, pb, raw, want string
+	}{
+		{"cumulus link", "cumulus", "link_down", "Interface swp1, changed state to down", "ip -s link show dev swp1"},
+		{"cumulus link, no iface", "cumulus", "link_down", "something went down", "ip -s link show"},
+		{"cumulus bgp", "cumulus", "bgp_peer_down", "bgpd: %ADJCHANGE: neighbor 10.0.0.2 Down", "vtysh -c 'show ip bgp summary'"},
+		{"cumulus ospf: none", "cumulus", "ospf_adj_down", "x", ""},
+		{"mikrotik link", "mikrotik", "link_down", "ether1 link down", "/interface print stats"},
+		{"mikrotik cpu", "mikrotik", "high_cpu", "x", "/system resource print"},
+		{"paloalto link", "paloalto", "link_down", "x", "show interface all"},
+		{"paloalto cpu", "paloalto", "high_cpu", "x", "show system info"},
+		{"paloalto ospf", "paloalto", "ospf_adj_down", "x", "show routing route"},
+		{"paloalto bgp", "paloalto", "bgp_peer_down", "x", "show routing route"},
+		{"cisco config diff", "cisco_ios", "config_change", "x", "show archive config differences nvram:startup-config system:running-config"},
+		{"junos config diff", "juniper_junos", "config_change", "x", "show system rollback compare 0 1"},
+		{"arista config diff", "arista", "config_change", "x", "show diff rollback-patch"},
+		{"huawei config diff", "huawei_vrp", "config_change", "x", "display configuration changes system-committed"},
+		{"vyos config diff: none", "vyos", "config_change", "x", ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := cmdsFor(tc.key, tc.pb, tc.raw); got != tc.want {
+				t.Errorf("\n got %q\nwant %q", got, tc.want)
+			}
+		})
+	}
 }

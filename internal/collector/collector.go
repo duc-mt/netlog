@@ -113,6 +113,16 @@ type IncidentReport struct {
 	Playbook    string    `json:"playbook"`
 	Diagnostics []DiagCmd `json:"diagnostics"`
 	TriageHints []string  `json:"triage_hints"`
+
+	// PeerIncidentID and PeerDevice link a link-fault incident to the
+	// secondary triage run on the device at the other end of the link
+	// (topology-aware triage). Both are empty when no peer was triaged.
+	PeerIncidentID string `json:"peer_incident_id,omitempty"`
+	PeerDevice     string `json:"peer_device,omitempty"`
+
+	// ConfigDiff is the output of the read-only configuration comparison
+	// captured right after a configuration change (config_change playbook).
+	ConfigDiff string `json:"config_diff,omitempty"`
 }
 
 // DiagCmd is one diagnostic command executed during triage and what it returned.
@@ -187,6 +197,7 @@ var logPlans = map[string]fetchPlan{
 	"pfsense":         {Commands: []string{"tail -q -n 300 /var/log/system.log /var/log/auth.log"}},
 	"checkpoint_gaia": {CheckPointGaia: true, Commands: []string{"tail -n 300 /var/log/messages"}},
 	"arista":          {Commands: []string{"show logging last 100 lines"}},
+	"cumulus":         {Commands: []string{"tail -n 300 /var/log/syslog"}},
 	"paloalto":        {Commands: []string{"show log system"}},
 	"generic":         {Commands: []string{"show logging"}},
 }
@@ -207,6 +218,7 @@ var clockCommands = map[string]string{
 	"vyos":            "date",
 	"pfsense":         "date",
 	"checkpoint_gaia": "date",
+	"cumulus":         "date",
 	"juniper_junos":   "show system uptime",
 	"mikrotik":        "/system clock print",
 	"fortigate":       "get system status",
@@ -370,6 +382,10 @@ func (d *Dialer) CloseJumps() {
 // direct connection. Priority: the inventory jump_host
 // name (resolved through NETLOG_JUMP_<NAME>_HOST, else used verbatim as
 // host[:port]), then the global default host, then NETLOG_JUMP_HOST.
+// ViaJump reports whether connections to dev go through a jump host, in which
+// case a direct network probe from this machine would test the wrong path.
+func (d *Dialer) ViaJump(dev inventory.Device) bool { return d.jumpAddr(dev) != "" }
+
 func (d *Dialer) jumpAddr(dev inventory.Device) string {
 	if !d.cfg.JumpEnabled {
 		return ""

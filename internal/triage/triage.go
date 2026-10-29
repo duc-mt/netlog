@@ -22,9 +22,21 @@
 //	                    (see cooldown.go); during cooldown no SSH session opens.
 //	GATE 3  resource    SSH connect <= 5s, each command <= 5s, <= 50 KB of
 //	        caps        output per command (truncated, not an error), <= 4
-//	                    commands per run, <= 3 concurrent triage sessions.
+//	                    commands per run (the neighbour-table command of a
+//	                    link-fault triage counts), <= 3 concurrent triage
+//	                    sessions, <= 5 peer triages queued or running.
 //
 // A gate failure aborts the triage silently (one log line, no retry).
+//
+// Two features build on the gates without bypassing them:
+//
+//   - Topology-aware peer triage (topology.go): a link-fault triage also reads
+//     the CDP/LLDP table and, when the remote end is in Config.Inventory,
+//     starts one secondary triage there. The peer's commands pass GATE 1, its
+//     (device, event) pair is subject to GATE 2 and it takes a GATE 3 slot. A
+//     peer triage never starts another one.
+//   - Config-diff capture (configdiff.go): the config_change playbook runs a
+//     read-only comparison command and stores its output in the incident.
 package triage
 
 import (
@@ -53,6 +65,12 @@ const (
 	MaxOutputBytes    = 50 * 1024
 	MaxCommands       = 4
 	MaxConcurrent     = 3
+
+	// MaxPeerTriage bounds the peer triages that are queued or running at
+	// once, so a network-wide link storm cannot pile up goroutines (and, once
+	// they reach their turn, SSH sessions) on the neighbours of every failed
+	// link. A peer that does not fit is skipped and noted in the incident.
+	MaxPeerTriage = 5
 )
 
 // vyosWrapper is prepended (after GATE 1) to VyOS operational commands, which
@@ -89,8 +107,14 @@ type Config struct {
 	// Logger receives triage progress and suppression notices. Nil disables.
 	Logger collector.Logger
 
-	// Hook is called with each finished incident. Nil means no-op.
+	// Hook is called with each finished incident, except config_change
+	// captures, which are evidence only. Nil means no-op.
 	Hook Hook
+
+	// Inventory enables topology-aware peer triage: a neighbour found in a
+	// link-fault device's CDP/LLDP table is triaged too when it is listed
+	// here. Nil or empty disables peer triage.
+	Inventory []inventory.Device
 
 	// Now overrides the clock (tests). Nil means time.Now.
 	Now func() time.Time
@@ -106,7 +130,24 @@ type Engine struct {
 	cooldown *Cooldown
 	sshOpts  sshclient.Options
 	sem      chan struct{}
+	peerSem  chan struct{}
 	wg       sync.WaitGroup
+}
+
+// job is one accepted triage, ready to run.
+type job struct {
+	sig       pipeline.TriageSignal
+	dev       inventory.Device
+	vendorKey string
+	cmds      []string // playbook commands, each already through GATE 1
+	topo      []string // neighbour-table commands (link faults only), through GATE 1
+
+	// Set for a peer triage: the incident ID and start time were fixed when
+	// the parent was written, so the parent can name the peer's incident.
+	peer    bool
+	id      string
+	started time.Time
+	origin  string // human-readable description of the parent, for the hints
 }
 
 type nopLogger struct{}
@@ -168,6 +209,7 @@ func New(cfg Config) (*Engine, error) {
 		cooldown: cd,
 		sshOpts:  opts,
 		sem:      make(chan struct{}, MaxConcurrent),
+		peerSem:  make(chan struct{}, MaxPeerTriage),
 	}, nil
 }
 
@@ -186,12 +228,22 @@ func (e *Engine) Handle(ctx context.Context, sig pipeline.TriageSignal, dev inve
 
 	cmds := Commands(key, sig.Playbook, sig.Entry)
 	if len(cmds) == 0 {
-		e.log.Info("triage %s: %s skipped, no %q playbook for vendor %s", host, event, sig.Playbook, key)
+		// A config change on a platform without a comparison command is
+		// routine and would otherwise log once per change.
+		if !isConfigDiff(sig.Playbook) {
+			e.log.Info("triage %s: %s skipped, no %q playbook for vendor %s", host, event, sig.Playbook, key)
+		}
 		return
 	}
 
+	// Link faults also read the neighbour table, when peers can be resolved.
+	var topo []string
+	if len(e.cfg.Inventory) > 0 && isLinkFault(sig.Playbook) {
+		topo = TopologyCommands(key)
+	}
+
 	// GATE 1: allowlist. Any failure aborts the whole triage.
-	for _, c := range cmds {
+	for _, c := range append(append([]string{}, cmds...), topo...) {
 		if err := Check(c); err != nil {
 			e.log.Warn("triage %s: %s aborted by allowlist gate: %v", host, event, err)
 			return
@@ -204,16 +256,26 @@ func (e *Engine) Handle(ctx context.Context, sig pipeline.TriageSignal, dev inve
 		return
 	}
 
-	// GATE 3 (part): at most MaxCommands per run.
-	if len(cmds) > MaxCommands {
-		cmds = cmds[:MaxCommands]
+	// GATE 3 (part): at most MaxCommands per run, the neighbour-table
+	// command included.
+	if len(topo) >= MaxCommands {
+		topo = nil
+	}
+	if len(cmds) > MaxCommands-len(topo) {
+		cmds = cmds[:MaxCommands-len(topo)]
 	}
 
 	e.wg.Add(1)
 	go func() {
 		defer e.wg.Done()
-		e.run(ctx, sig, dev, key, cmds)
+		e.run(ctx, job{sig: sig, dev: dev, vendorKey: key, cmds: cmds, topo: topo})
 	}()
+}
+
+// isLinkFault reports whether the playbook is one that benefits from looking
+// at the other end of the link.
+func isLinkFault(playbook string) bool {
+	return playbook == pipeline.PlaybookLinkDown || playbook == pipeline.PlaybookLinkFlap
 }
 
 // Wait blocks until every triage started by Handle has finished.
@@ -226,7 +288,9 @@ func (e *Engine) Close() {
 }
 
 // run executes an accepted triage: connect, run the commands, write the report.
-func (e *Engine) run(ctx context.Context, sig pipeline.TriageSignal, dev inventory.Device, vendorKey string, cmds []string) {
+func (e *Engine) run(ctx context.Context, j job) {
+	dev, sig := j.dev, j.sig
+
 	// A triage runs on its own goroutine, where an unrecovered panic (a bug,
 	// or a hook that misbehaves) would take the whole monitor down.
 	defer func() {
@@ -243,9 +307,13 @@ func (e *Engine) run(ctx context.Context, sig pipeline.TriageSignal, dev invento
 		return
 	}
 
-	started := e.now().UTC()
+	started, id := j.started, j.id
+	if id == "" {
+		started = e.now().UTC()
+		id = incidentID(dev.Hostname, sig.Playbook, started)
+	}
 	report := collector.IncidentReport{
-		ID:          collector.EntryID(dev.Hostname, sig.Playbook+started.Format(time.RFC3339Nano))[:8],
+		ID:          id,
 		Timestamp:   started,
 		Hostname:    dev.Hostname,
 		TriggerLog:  sig.Entry,
@@ -253,6 +321,7 @@ func (e *Engine) run(ctx context.Context, sig pipeline.TriageSignal, dev invento
 		Diagnostics: []collector.DiagCmd{},
 	}
 
+	var peerNote string
 	client, err := e.dialer.Dial(ctx, dev)
 	if err != nil {
 		// The failure is itself evidence ("device unreachable at 10:22"), so
@@ -260,14 +329,39 @@ func (e *Engine) run(ctx context.Context, sig pipeline.TriageSignal, dev invento
 		report.Diagnostics = append(report.Diagnostics, collector.DiagCmd{Command: "(connect)", Error: err.Error()})
 	} else {
 		defer client.Close()
-		for _, cmd := range cmds {
+		for _, cmd := range j.cmds {
 			if ctx.Err() != nil {
 				break
 			}
-			report.Diagnostics = append(report.Diagnostics, e.exec(ctx, client, vendorKey, cmd))
+			report.Diagnostics = append(report.Diagnostics, e.exec(ctx, client, j.vendorKey, cmd))
+		}
+		var topoOut []collector.DiagCmd
+		for _, cmd := range j.topo {
+			if ctx.Err() != nil {
+				break
+			}
+			d := e.exec(ctx, client, j.vendorKey, cmd)
+			report.Diagnostics = append(report.Diagnostics, d)
+			topoOut = append(topoOut, d)
+		}
+		// A peer triage never starts another one: two devices that name each
+		// other as neighbours would otherwise triage in a loop.
+		if len(topoOut) > 0 && !j.peer {
+			peerNote = e.spawnPeer(ctx, j, &report, topoOut)
 		}
 	}
+
 	report.TriageHints = buildHints(sig, report.Diagnostics)
+	if j.peer && j.origin != "" {
+		report.TriageHints = append(report.TriageHints, j.origin)
+	}
+	if peerNote != "" {
+		report.TriageHints = append(report.TriageHints, peerNote)
+	}
+	if isConfigDiff(sig.Playbook) {
+		report.ConfigDiff = configDiffOf(report.Diagnostics)
+		report.TriageHints = append(report.TriageHints, configDiffHint(report.ConfigDiff))
+	}
 
 	path, err := store.WriteIncident(store.IncidentsDir(e.cfg.DataDir), report)
 	if err != nil {
@@ -275,7 +369,99 @@ func (e *Engine) run(ctx context.Context, sig pipeline.TriageSignal, dev invento
 		return
 	}
 	e.log.Info("triage %s: %s captured %d diagnostic command(s) -> %s", dev.Hostname, sig.Entry.Event, len(report.Diagnostics), path)
-	e.hook.OnIncident(report, path)
+	if !isConfigDiff(sig.Playbook) {
+		e.hook.OnIncident(report, path)
+	}
+}
+
+// incidentID derives the 8-character incident ID from device, playbook and
+// start time (the same derivation as always; spawnPeer uses it to name a peer
+// incident before that incident exists).
+func incidentID(host, playbook string, started time.Time) string {
+	return collector.EntryID(host, playbook+started.Format(time.RFC3339Nano))[:8]
+}
+
+// spawnPeer reads the neighbour on the faulted interface out of the topology
+// command's output and, if it is an inventory device, starts a secondary
+// triage there. It records the link in the parent report (PeerIncidentID,
+// PeerDevice) and returns a one-line note for the parent's hints.
+func (e *Engine) spawnPeer(ctx context.Context, j job, report *collector.IncidentReport, topoOut []collector.DiagCmd) string {
+	iface := pipeline.ExtractInterface(j.sig.Entry.Raw)
+	if iface == "" {
+		return "Peer triage skipped: no interface could be read from the triggering log line."
+	}
+	var neighbors []Neighbor
+	for _, d := range topoOut {
+		neighbors = append(neighbors, ParseNeighbors(family(j.vendorKey), d.Output)...)
+	}
+	n, ok := FindNeighbor(neighbors, iface)
+	if !ok {
+		return fmt.Sprintf("Peer triage skipped: no CDP/LLDP neighbour is listed on %s (no neighbour, or the table was truncated).", iface)
+	}
+	peerDev, ok := FindPeer(e.cfg.Inventory, n, j.dev.Hostname)
+	if !ok {
+		return fmt.Sprintf("Peer triage skipped: neighbour %s (%s) is not in the inventory.", n.RemoteName, n.RemotePort)
+	}
+
+	pkey, known := vendor.CanonicalKey(peerDev.Vendor)
+	if !known {
+		pkey = "generic"
+	}
+	psig := j.sig
+	psig.Entry.Hostname = peerDev.Hostname
+	psig.Entry.IP = peerDev.Address
+	psig.Entry.Object = n.RemotePort
+	psig.Entry.Raw = fmt.Sprintf("peer-triggered: Interface %s, changed state to down (remote end of %s %s)", n.RemotePort, j.dev.Hostname, iface)
+	psig.Annotations = []string{"Peer triage: this device is the remote end of the faulted link."}
+
+	pcmds := Commands(pkey, psig.Playbook, psig.Entry)
+	if len(pcmds) == 0 {
+		return fmt.Sprintf("Peer triage skipped: no %q playbook for %s (%s).", psig.Playbook, peerDev.Hostname, pkey)
+	}
+	if len(pcmds) > MaxCommands {
+		pcmds = pcmds[:MaxCommands]
+	}
+	// GATE 1 for the peer's commands. The interface name is an advertisement
+	// from the neighbour, which is why it is checked like any other input.
+	for _, c := range pcmds {
+		if err := Check(c); err != nil {
+			e.log.Warn("triage %s: peer triage of %s aborted by allowlist gate: %v", j.dev.Hostname, peerDev.Hostname, err)
+			return fmt.Sprintf("Peer triage of %s skipped: a command failed the allowlist gate.", peerDev.Hostname)
+		}
+	}
+
+	// The peer slot is taken before the cooldown so that a refusal here does
+	// not use up the peer's cooldown period.
+	select {
+	case e.peerSem <- struct{}{}:
+	default:
+		e.log.Warn("triage %s: peer triage of %s skipped, %d peer triages already queued or running", j.dev.Hostname, peerDev.Hostname, MaxPeerTriage)
+		return fmt.Sprintf("Peer triage of %s skipped: %d peer triages are already queued or running.", peerDev.Hostname, MaxPeerTriage)
+	}
+	event := psig.Entry.Event
+	if allowed, remaining := e.cooldown.Allow(peerDev.Hostname, event); !allowed {
+		<-e.peerSem
+		e.log.Info("triage %s: peer triage of %s suppressed, in cooldown for another %s", j.dev.Hostname, peerDev.Hostname, remaining.Round(time.Second))
+		return fmt.Sprintf("Peer triage of %s skipped: that device was triaged for %s within the cooldown period; see its own incident.", peerDev.Hostname, event)
+	}
+
+	started := e.now().UTC()
+	pid := incidentID(peerDev.Hostname, psig.Playbook, started)
+	report.PeerIncidentID = pid
+	report.PeerDevice = peerDev.Hostname
+
+	pj := job{
+		sig: psig, dev: peerDev, vendorKey: pkey, cmds: pcmds,
+		peer: true, id: pid, started: started,
+		origin: fmt.Sprintf("Started by the link fault on %s %s (incident %s).", j.dev.Hostname, iface, report.ID),
+	}
+	e.wg.Add(1) // safe: the caller is itself counted in e.wg
+	go func() {
+		defer e.wg.Done()
+		defer func() { <-e.peerSem }()
+		e.run(ctx, pj)
+	}()
+	return fmt.Sprintf("Peer triage started on %s %s (incident %s).", peerDev.Hostname, n.RemotePort, pid)
 }
 
 // exec runs one gated command and returns its DiagCmd. The command recorded

@@ -22,7 +22,17 @@ import (
 // LockFileEx and returns the function that releases it. The Windows kernel
 // automatically releases file locks if the process dies or exits.
 func lockDataDir(dir string) (func(), error) {
-	p := filepath.Join(dir, ".netlog.lock")
+	return lockFile(filepath.Join(dir, ".netlog.lock"))
+}
+
+// lockListener is the same for "netlog listen", on its own lock file: one
+// listener per data directory, but a listener and a collect/monitor run may
+// share it (they append whole batches to the daily JSONL files).
+func lockListener(dir string) (func(), error) {
+	return lockFile(filepath.Join(dir, ".netlog-listen.lock"))
+}
+
+func lockFile(p string) (func(), error) {
 	f, err := os.OpenFile(p, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("opening lock file: %w", err)

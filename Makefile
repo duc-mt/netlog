@@ -33,6 +33,7 @@ fuzz:
 	go test -mod=vendor -run '^$$' -fuzz '^FuzzParseDeviceClock$$' -fuzztime $(FUZZTIME) ./internal/pipeline
 	go test -mod=vendor -run '^$$' -fuzz '^FuzzClassifyAndExtract$$' -fuzztime $(FUZZTIME) ./internal/pipeline
 	go test -mod=vendor -run '^$$' -fuzz '^FuzzCheck$$' -fuzztime $(FUZZTIME) ./internal/triage
+	go test -mod=vendor -run '^$$' -fuzz '^FuzzParsePoE$$' -fuzztime $(FUZZTIME) ./internal/diagnose
 
 # Everything CI checks, in one go.
 check: vet test

@@ -90,6 +90,10 @@ func For(vendorKey string, opts Options) Parser {
 		p = &fortigateParser{key: vendorKey, opts: opts}
 	case "mikrotik":
 		p = &mikrotikParser{key: vendorKey, opts: opts}
+	case "cumulus":
+		p = &cumulusParser{key: vendorKey, opts: opts}
+	case "paloalto":
+		p = newPaloAltoParser(vendorKey, opts)
 	case "pfsense":
 		p = &pfsenseParser{key: vendorKey, opts: opts}
 	case "checkpoint_gaia":

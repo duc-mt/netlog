@@ -286,3 +286,134 @@ func TestInvalidUTF8IsReplacedConsistently(t *testing.T) {
 		t.Fatalf("Raw must survive JSON unchanged so the ID still matches: %v", err)
 	}
 }
+
+// ---- PAN-OS, Cumulus and forwarded MikroTik syslog ---------------------------------
+
+func TestPaloAltoForwardedSyslog(t *testing.T) {
+	const (
+		system  = `Oct 20 09:30:15 pa-fw1 1,2026/10/20 09:30:14,001234567890,SYSTEM,general,0,2026/10/20 09:30:14,vsys1,general,,0,0,general,high,"Login failed for user admin from 10.1.1.9",123456,0x0,0,0,0,0,,pa-fw1`
+		config  = `Oct 20 09:31:00 pa-fw1 1,2026/10/20 09:30:59,001234567890,CONFIG,0,0,2026/10/20 09:30:59,10.1.1.5,vsys1,set,tanvt,Web,Succeeded, /config/shared/log-settings,,,123457,0x0,0,0,0,0,,pa-fw1`
+		traffic = `2026-10-20T09:32:00+07:00 pa-fw1 1,2026/10/20 09:31:58,001234567890,TRAFFIC,end,2305,2026/10/20 09:31:58,10.0.0.5,8.8.8.8,0.0.0.0,0.0.0.0,allow-dns,,,dns,vsys1,trust,untrust,ethernet1/1,ethernet1/2,fwd,2026/10/20 09:31:58,1001,1,5555,53,0,0,0x19,udp,allow,200,100,100,2,2026/10/20 09:31:50,8,any,0,1,0x0`
+		threat  = `Oct 20 09:33:00 pa-fw1 1,2026/10/20 09:32:59,001234567890,THREAT,vulnerability,2305,2026/10/20 09:32:59,203.0.113.9,10.0.0.5,0.0.0.0,0.0.0.0,inbound,,,ssh,vsys1,untrust,trust,ethernet1/2,ethernet1/1,fwd,2026/10/20 09:32:59,1002,1,4444,22,0,0,0x2000,tcp,reset-both,,SSH User Authentication Brute-force Attempt(40015),any,high,client-to-server,1`
+	)
+	tests := []struct {
+		name, line, facility string
+		ts                   time.Time
+		user, src, summary   string
+	}{
+		{"system", system, "SEC", time.Date(2026, 10, 20, 9, 30, 14, 0, testLoc), "admin", "10.1.1.9", "Login failed for user admin from 10.1.1.9"},
+		{"config", config, "CFG", time.Date(2026, 10, 20, 9, 30, 59, 0, testLoc), "tanvt", "10.1.1.5", "tanvt set /config/shared/log-settings (Succeeded)"},
+		{"traffic", traffic, "TRAFFIC", time.Date(2026, 10, 20, 9, 31, 58, 0, testLoc), "", "", "10.0.0.5 -> 8.8.8.8 dns rule allow-dns allow"},
+		{"threat", threat, "THREAT", time.Date(2026, 10, 20, 9, 32, 59, 0, testLoc), "", "", "SSH User Authentication Brute-force Attempt(40015) 203.0.113.9 -> 10.0.0.5 reset-both high"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			e := parseOne(t, "paloalto", tc.line)
+			if !e.DeviceTS.Equal(tc.ts) {
+				t.Errorf("DeviceTS = %v, want %v", e.DeviceTS, tc.ts)
+			}
+			if e.Facility != tc.facility {
+				t.Errorf("Facility = %q, want %q", e.Facility, tc.facility)
+			}
+			if e.User != tc.user || e.SourceIP != tc.src {
+				t.Errorf("attribution = (%q,%q), want (%q,%q)", e.User, e.SourceIP, tc.user, tc.src)
+			}
+			if e.Summary != tc.summary {
+				t.Errorf("Summary = %q, want %q", e.Summary, tc.summary)
+			}
+			if e.Raw != tc.line || e.ID != collector.EntryID("SW1", tc.line) {
+				t.Errorf("Raw / ID not preserved")
+			}
+		})
+	}
+}
+
+func TestPaloAltoKeepsShowLogSystemFormat(t *testing.T) {
+	e := parseOne(t, "paloalto", "2026/10/20 09:30:15 high general general 0 Login failed for user admin")
+	if !e.DeviceTS.Equal(time.Date(2026, 10, 20, 9, 30, 15, 0, testLoc)) || e.Facility != "SEC" {
+		t.Errorf("show log system line misparsed: %+v", e)
+	}
+}
+
+func TestPaloAltoShortAndHostileRecords(t *testing.T) {
+	// Too short for its type: still an entry (header fields are present), no panic.
+	short := "Oct 20 09:30:15 pa-fw1 1,2026/10/20 09:30:14,001234567890,SYSTEM,general,0,2026/10/20 09:30:14,vsys1"
+	e := parseOne(t, "paloalto", short)
+	if e.Facility == "" || e.Summary == "" {
+		t.Errorf("short record: %+v", e)
+	}
+	// Not a PAN-OS record at all, a bad time, an unknown type: dropped, never panicking.
+	for _, line := range []string{
+		"Oct 20 09:30:15 pa-fw1 a,b,c,d,e,f,g,h,i",
+		"1,not-a-time,001,SYSTEM,general,0,not-a-time,x",
+		"1,2026/10/20 09:30:14,001,BOGUS,general,0,2026/10/20 09:30:14,x",
+		`1,2026/10/20 09:30:14,001,"SYSTEM,general,0,2026/10/20 09:30:14,x`,
+		strings.Repeat(",", 5000),
+	} {
+		if got := Parse("paloalto", line, testDev, testOpt); len(got) > 1 {
+			t.Errorf("%q: %d entries", line, len(got))
+		}
+	}
+}
+
+func TestCumulusSyslog(t *testing.T) {
+	tests := []struct {
+		name, line, facility string
+		ts                   time.Time
+		user, src            string
+	}{
+		{"switchd link", "Oct 20 09:31:02 leaf01 switchd[1234]: swp1: link down", "LINK", time.Date(2026, 10, 20, 9, 31, 2, 0, testLoc), "", ""},
+		{"bgpd iso", "2026-10-20T09:31:03.123456+07:00 leaf01 bgpd[987]: %ADJCHANGE: neighbor 10.0.0.2(swp1) in vrf default Down Peer closed the session", "BGP", time.Date(2026, 10, 20, 9, 31, 3, 123456000, time.FixedZone("+07:00", 7*3600)), "", ""},
+		{"ospfd", "Oct 20 09:31:04 leaf01 ospfd[55]: %ADJCHG: Nbr 10.0.0.3 on swp2:10.0.0.4 from Full to Down", "OSPF", time.Date(2026, 10, 20, 9, 31, 4, 0, testLoc), "", ""},
+		{"mstpd", "Oct 20 09:31:05 leaf01 mstpd: topology change detected on bridge br_default", "STP", time.Date(2026, 10, 20, 9, 31, 5, 0, testLoc), "", ""},
+		{"zebra", "Oct 20 09:31:06 leaf01 zebra[88]: Interface swp3 is down", "LINK", time.Date(2026, 10, 20, 9, 31, 6, 0, testLoc), "", ""},
+		{"sshd", "Oct 20 09:31:07 leaf01 sshd[5]: Accepted publickey for cumulus from 10.1.1.5 port 5555 ssh2", "SEC", time.Date(2026, 10, 20, 9, 31, 7, 0, testLoc), "cumulus", "10.1.1.5"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			e := parseOne(t, "cumulus", tc.line)
+			if !e.DeviceTS.Equal(tc.ts) || e.Facility != tc.facility || e.User != tc.user || e.SourceIP != tc.src {
+				t.Errorf("got ts=%v fac=%q user=%q src=%q, want ts=%v fac=%q user=%q src=%q",
+					e.DeviceTS, e.Facility, e.User, e.SourceIP, tc.ts, tc.facility, tc.user, tc.src)
+			}
+			if e.Raw != tc.line || e.Vendor != "cumulus" {
+				t.Errorf("Raw/Vendor wrong: %+v", e)
+			}
+		})
+	}
+	if got := Parse("cumulus", "not a syslog line\n\n   \nOct 20 09:31:07", testDev, testOpt); len(got) != 0 {
+		t.Errorf("garbage produced %d entries", len(got))
+	}
+}
+
+func TestMikroTikForwardedSyslog(t *testing.T) {
+	tests := []struct {
+		name, line, facility, user, src string
+		sec                             int
+	}{
+		{"interface", "Oct 20 09:31:00 edge-rtr2 interface,info ether1 link down", "LINK", "", "", 0},
+		{"account", "Oct 20 09:31:01 edge-rtr2 system,info,account user admin logged in from 10.1.1.1 via ssh", "SEC", "admin", "10.1.1.1", 1},
+		{"system change", "Oct 20 09:31:02 edge-rtr2 system,info ip address added by tanvt", "SYS", "tanvt", "", 2},
+		{"firewall", "Oct 20 09:31:03 edge-rtr2 firewall,info DROP-IN: in:ether1 out:(unknown 0), proto TCP (SYN), 203.0.113.9:4444->198.51.100.1:22, len 60", "FW", "", "", 3},
+		{"colon form", "Oct 20 09:31:04 edge-rtr2 system,error,critical: login failure for user admin from 10.1.1.1 via ssh", "SYS", "admin", "10.1.1.1", 4},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			e := parseOne(t, "mikrotik", tc.line)
+			if e.Facility != tc.facility || e.User != tc.user || e.SourceIP != tc.src {
+				t.Errorf("got fac=%q user=%q src=%q, want %q %q %q", e.Facility, e.User, e.SourceIP, tc.facility, tc.user, tc.src)
+			}
+			if !e.DeviceTS.Equal(time.Date(2026, 10, 20, 9, 31, tc.sec, 0, testLoc)) {
+				t.Errorf("DeviceTS = %v", e.DeviceTS)
+			}
+		})
+	}
+	// The /log print forms keep working next to the forwarded one.
+	if e := parseOne(t, "mikrotik", "09:31:00 interface,info ether1 link down"); e.Facility != "LINK" {
+		t.Errorf("log print form regressed: %+v", e)
+	}
+	// A plain syslog line without "topic,severity" is not a RouterOS line.
+	if got := Parse("mikrotik", "Oct 20 09:31:00 edge-rtr2 sshd[1]: hello", testDev, testOpt); len(got) != 0 {
+		t.Errorf("non-RouterOS syslog line accepted: %+v", got)
+	}
+}

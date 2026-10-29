@@ -21,7 +21,18 @@ import (
 // returns the function that releases it. The kernel drops the lock if the
 // process dies, so a crashed run never leaves the directory locked.
 func lockDataDir(dir string) (func(), error) {
-	f, err := os.OpenFile(filepath.Join(dir, ".netlog.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	return lockFile(filepath.Join(dir, ".netlog.lock"))
+}
+
+// lockListener is the same for "netlog listen", on its own lock file: one
+// listener per data directory, but a listener and a collect/monitor run may
+// share it (they append whole batches to the daily JSONL files).
+func lockListener(dir string) (func(), error) {
+	return lockFile(filepath.Join(dir, ".netlog-listen.lock"))
+}
+
+func lockFile(path string) (func(), error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("opening lock file: %w", err)
 	}

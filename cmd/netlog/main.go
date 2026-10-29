@@ -31,6 +31,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -101,6 +102,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return cmdTelegramTest(args[1:], stdout, stderr)
 	case "diagnose":
 		return cmdDiagnose(args[1:], stdout, stderr)
+	case "listen":
+		return cmdListen(args[1:], stdout, stderr)
+	case "top":
+		return cmdTop(args[1:], stdout, stderr)
 	case "version", "-version", "--version":
 		fmt.Fprintln(stdout, "netlog", version)
 		return exitOK
@@ -126,7 +131,9 @@ Usage:
   netlog incidents [flags]   list auto-triage reports, or show one with --id
   netlog report    [flags]   rankings and trends: noisy devices, changes, watchlist
   netlog status    [flags]   per-device collection health: failing, stale, silent
-  netlog diagnose  <device> [flags]  one-shot health check: SSH, alarms, BGP/OSPF, CRC errors, optical DDM
+  netlog diagnose  <device> [flags]  one-shot health check: reachability probe, SSH, alarms, BGP/OSPF, CRC errors, optical DDM, PoE
+  netlog listen    [flags]   receive syslog from the devices (UDP/TCP 514), store and analyse it live
+  netlog top       [flags]   live terminal dashboard: events, outages, device health (q quits)
   netlog telegram-test [flags] send a test notification to verified Telegram configuration
   netlog version
 
@@ -137,6 +144,7 @@ Examples:
   netlog collect --inventory inventory.csv --env-file .env --data-dir data
   netlog monitor --interval 2m --data-dir data
   netlog diagnose core-gw-1 --raw                                 quick triage of one device
+  netlog listen --port 5514 --data-dir data                       live syslog intake (ports below 1024 need root)
   netlog query --category CONFIG --since 24h
   netlog query --severity CRITICAL --since today --format json
   netlog timeline --from "2026-10-20 10:10:00" --to "2026-10-20 10:25:00"
@@ -225,6 +233,9 @@ type collectOpts struct {
 	afterHoursEnd         int
 	dryRun                bool
 	noColor               bool
+	noConfigDiff          bool
+	noPeerTriage          bool
+	tui                   bool
 }
 
 func envInt(key string, def int) int {
@@ -253,11 +264,14 @@ func (o *collectOpts) register(fs *flag.FlagSet, monitor bool) {
 	fs.IntVar(&o.afterHoursStart, "after-hours-start", envInt("NETLOG_AFTER_HOURS_START", pipeline.DefaultAfterHoursStart), "first hour (0-23) of after-hours change window")
 	fs.IntVar(&o.afterHoursEnd, "after-hours-end", envInt("NETLOG_AFTER_HOURS_END", pipeline.DefaultAfterHoursEnd), "first hour (0-23) after which changes are no longer after-hours")
 	fs.BoolVar(&o.noColor, "no-color", false, "disable coloured output")
+	fs.BoolVar(&o.noConfigDiff, "no-config-diff", false, "do not open an SSH session to capture a configuration diff after a configuration change")
+	fs.BoolVar(&o.noPeerTriage, "no-peer-triage", false, "do not triage the neighbour at the other end of a faulted link")
 	if !monitor {
 		fs.BoolVar(&o.dryRun, "dry-run", false, "test connectivity, authentication and clock skew without saving logs or running triage")
 	}
 	if monitor {
 		fs.DurationVar(&o.interval, "interval", collector.DefaultInterval, "polling interval; devices start staggered across the first part of it")
+		fs.BoolVar(&o.tui, "tui", false, "show the live terminal dashboard (as 'netlog top') while monitoring; log lines go to <data-dir>/monitor.log")
 	}
 }
 
@@ -305,6 +319,10 @@ func cmdCollect(args []string, stdout, stderr io.Writer, monitor bool) int {
 		return exitUsage
 	}
 
+	if monitor && o.tui {
+		return runMonitorTUI(o, stdout, stderr)
+	}
+
 	log := &stderrLogger{w: stderr}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -340,6 +358,12 @@ func cmdCollect(args []string, stdout, stderr io.Writer, monitor bool) int {
 		return exitOK
 	}
 
+	a.monitorLoop(ctx, o, log)
+	return exitOK
+}
+
+// monitorLoop polls on the configured interval until ctx is cancelled.
+func (a *app) monitorLoop(ctx context.Context, o collectOpts, log *stderrLogger) {
 	log.Info("netlog monitor started: %d device(s), interval %s", len(a.devices), o.interval)
 	for ctx.Err() == nil {
 		began := time.Now()
@@ -357,7 +381,6 @@ func cmdCollect(args []string, stdout, stderr io.Writer, monitor bool) int {
 		}
 	}
 	log.Info("shutting down: waiting for in-flight triage")
-	return exitOK
 }
 
 // app holds everything a collect/monitor run needs.
@@ -475,6 +498,10 @@ func newApp(o collectOpts, log *stderrLogger) (*app, error) {
 		log.Info("telegram alerts enabled (chat_id: %s)", creds.Get("TELEGRAM_CHAT_ID"))
 	}
 
+	var peerInventory []inventory.Device // nil disables topology-aware peer triage
+	if !o.noPeerTriage {
+		peerInventory = devices
+	}
 	engine, err := triage.New(triage.Config{
 		DataDir:         o.dataDir,
 		SSH:             sshOpts,
@@ -483,6 +510,7 @@ func newApp(o collectOpts, log *stderrLogger) (*app, error) {
 		JumpDefaultHost: o.jumpHost,
 		Logger:          log,
 		Hook:            tg,
+		Inventory:       peerInventory,
 	})
 	if err != nil {
 		if tg != nil {
@@ -496,7 +524,7 @@ func newApp(o collectOpts, log *stderrLogger) (*app, error) {
 	// Seed the anomaly windows from the last few minutes of stored events, so
 	// a cron-driven "collect" (a new process every run) still sees flaps,
 	// login bursts and config changes that straddle two runs.
-	det := pipeline.NewDetector(pipeline.DetectorConfig{})
+	det := pipeline.NewDetector(pipeline.DetectorConfig{ConfigSignals: !o.noConfigDiff})
 	if recent, err := query.LoadTail(o.dataDir, query.Filter{Since: time.Now().Add(-primeWindow)}, primeTailBytes); err != nil {
 		log.Warn("priming anomaly detector from stored logs: %v", err)
 	} else {
@@ -1266,6 +1294,8 @@ func cmdDiagnose(args []string, stdout, stderr io.Writer) int {
 		iface   = fs.String("interface", "", "limit the CRC and optical checks to one interface")
 		raw     = fs.Bool("raw", false, "print the verbatim device output under each check")
 		failBad = fs.Bool("fail", false, "exit 1 when the device is unreachable or any check needs attention")
+		noProbe = fs.Bool("no-probe", false, "skip the local reachability probe (TCP connect latency, ICMP echo, route and MTU)")
+		asJSON  = fs.Bool("json", false, "print the report as JSON instead of text")
 	)
 	fs.StringVar(&o.inventory, "inventory", "inventory.csv", "path to the device inventory CSV")
 	fs.StringVar(&o.envFile, "env-file", ".env", "path to an optional .env file with NETLOG_USERNAME / NETLOG_PASSWORD")
@@ -1356,8 +1386,18 @@ func cmdDiagnose(args []string, stdout, stderr io.Writer) int {
 		Interface:      *iface,
 		CommandTimeout: o.commandTimeout,
 		SSH:            sshOpts,
+		NoProbe:        *noProbe,
 	})
-	diagnose.Render(stdout, rep, diagnose.RenderOptions{Color: colorEnabled(stdout, o.noColor), Raw: *raw})
+	if *asJSON {
+		enc := json.NewEncoder(stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(rep); err != nil {
+			fmt.Fprintf(stderr, "netlog diagnose: %v\n", err)
+			return exitError
+		}
+	} else {
+		diagnose.Render(stdout, rep, diagnose.RenderOptions{Color: colorEnabled(stdout, o.noColor), Raw: *raw})
+	}
 	if *failBad && !rep.Healthy() {
 		return exitError
 	}

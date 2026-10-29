@@ -57,8 +57,14 @@ const (
 	PlaybookHighCPU        = "high_cpu"
 	PlaybookOpticsAlarm    = "optics_alarm"
 	PlaybookBruteForce     = "brute_force"
-	PlaybookConfigDiff     = "config_diff"
 	PlaybookPacketCapture  = "packet_capture"
+
+	// PlaybookConfigChange captures a configuration comparison right after a
+	// CONFIG_CHANGE / AFTER_HOURS_CHANGE (see DetectorConfig.ConfigSignals).
+	PlaybookConfigChange = "config_change"
+
+	// PlaybookConfigDiff is an alias for PlaybookConfigChange.
+	PlaybookConfigDiff = PlaybookConfigChange
 )
 
 // Signal priorities.
@@ -105,6 +111,12 @@ type DetectorConfig struct {
 	CorrelationWindow time.Duration // config-change-to-fault window (default 10m)
 	MaxSignalAge      time.Duration // oldest entry that may emit a signal (default 15m)
 	Now               func() time.Time
+
+	// ConfigSignals makes a fresh CONFIG_CHANGE / AFTER_HOURS_CHANGE emit a
+	// config_change signal (PlaybookConfigChange), so the triage engine can
+	// capture a configuration diff. The zero value keeps the historical
+	// behaviour: configuration changes only feed the fault correlation.
+	ConfigSignals bool
 }
 
 func (c *DetectorConfig) setDefaults() {
@@ -280,14 +292,10 @@ func (d *Detector) observe(e collector.LogEntry) []TriageSignal {
 	switch e.Event {
 	case EventConfigChange, EventAfterHoursChange:
 		st.lastConfig = &configChange{user: e.User, at: ts}
-		if !fresh {
-			return nil
+		if d.cfg.ConfigSignals {
+			return d.simple(st, e, fresh, PlaybookConfigChange, PriorityLow)
 		}
-		prio := PriorityLow
-		if e.Event == EventAfterHoursChange {
-			prio = PriorityMedium
-		}
-		return []TriageSignal{d.signal(st, e, PlaybookConfigDiff, prio, false)}
+		return nil
 
 	case EventLinkFlap:
 		// A previously reported flap (replayed from storage): restore its
@@ -527,7 +535,7 @@ var interfacePatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)\binterface\s+([A-Za-z][\w/.:-]*\d)\b`),                                                             // Cisco, Huawei, Arista
 	regexp.MustCompile(`(?i)\binterface\s+(\d+(?:/\d+)+)\b`),                                                                    // Aruba CX "1/1/24"
 	regexp.MustCompile(`\bon\s+([A-Za-z][A-Za-z0-9/.:_-]*\d)\b`),                                                                // OSPF "... on Gi0/1 ..."
-	regexp.MustCompile(`\b((?:eth|ens|enp|eno|bond|br|vti|tun|wg|veth|vxlan|dum|lo)\d[\w./:-]*)`),                               // Linux / VyOS
+	regexp.MustCompile(`\b((?:eth|ens|enp|eno|bond|br|vti|tun|wg|veth|vxlan|dum|lo|swp)\d[\w./:-]*)`),                           // Linux / VyOS / Cumulus (swp1, swp1s0)
 	regexp.MustCompile(`\b(ether\d+|sfp[\w-]*\d+|bridge\d*|vlan\d+)\b`),                                                         // MikroTik
 	regexp.MustCompile(`\b([A-Za-z]{2,}-?\d+(?:/\d+)+(?:\.\d+)?)`),                                                              // Gi0/1, ge-0/0/1, 1/0/24
 	regexp.MustCompile(`\b((?:igb|ixl|ix|em|re|bge|bce|vtnet|vmx|mlxen|lagg|ovpnc|ovpns|enc|gif|gre|pppoe|ng)\d+(?:\.\d+)?)\b`), // FreeBSD / pfSense

@@ -74,6 +74,9 @@ const (
 	// EventPasswordSpray is derived by the detector: one source address
 	// failing logins on several devices (see DetectorConfig.SprayDevices).
 	EventPasswordSpray = "PASSWORD_SPRAY_ATTEMPT"
+
+	// EventThreatDetected is a firewall threat-log record (Palo Alto THREAT).
+	EventThreatDetected = "THREAT_DETECTED"
 )
 
 // DefaultAfterHoursStart and DefaultAfterHoursEnd define the default 00:00-06:00 window.
@@ -97,6 +100,16 @@ func mk(pattern, category, event, severity string) rule {
 var rules = []rule{
 	mk(`config_i|commit\[|cmdrecord|ui_commit|cfgpath=|configuration chang(?:e|ed)|clish\[\d+\]:\s*cmd by \S+:\s*start executing\s*:\s*(?:set|add|delete|remove|save|load)\b`,
 		collector.CategoryConfig, EventConfigChange, collector.SeverityWarning),
+
+	// Palo Alto CONFIG records (receive time, serial, "CONFIG") and MikroTik
+	// "<item> added|changed|removed by <user>" messages.
+	mk(`\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2},[^,]*,config,|system,info[^ ]*\s.*\b(?:added|changed|removed|moved|enabled|disabled) by [A-Za-z0-9_.@-]+`,
+		collector.CategoryConfig, EventConfigChange, collector.SeverityWarning),
+
+	// Palo Alto THREAT records. Before the login rules: a threat name such as
+	// "SSH Brute-force login attempt" must not be filed as an authentication event.
+	mk(`\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2},[^,]*,threat,`,
+		collector.CategorySecurity, EventThreatDetected, collector.SeverityWarning),
 
 	mk(`login[ _]success(?:ful)?|successful login|accepted (?:password|publickey|keyboard-interactive)|logged in (?:successfully|from)|succeeded in logging in`,
 		collector.CategoryAuth, EventLoginSuccess, collector.SeverityInfo),

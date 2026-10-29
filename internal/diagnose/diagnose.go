@@ -12,16 +12,20 @@
 // Notes:         Go package implementation
 // ==============================================================================
 // Package diagnose runs a fixed set of strictly read-only checks against one
-// device (SSH reachability, active alarms, routing adjacencies, interface
-// errors and optical DDM power) and renders a short report.
+// device (a local reachability probe, SSH reachability, active alarms, routing
+// adjacencies, interface errors, optical DDM power and, on campus switches,
+// the PoE budget) and renders a short report.
 //
-// Every command passes the triage allowlist (GATE 1, triage.Check) before it
-// is sent, exactly like auto-triage. A failing command never aborts the run:
-// each section reports its own error.
+// Every command sent to the device passes the triage allowlist (GATE 1,
+// triage.Check) before it is sent, exactly like auto-triage. The reachability
+// probe (probe.go) sends no device command: it only opens TCP connections and
+// ICMP echoes to the management address. A failing command never aborts the
+// run: each section reports its own error.
 package diagnose
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -91,16 +95,21 @@ type Options struct {
 	CommandTimeout time.Duration
 	// SSH carries host-key and algorithm settings for command execution.
 	SSH sshclient.Options
+	// NoProbe skips the local path and reachability probe.
+	NoProbe bool
+	// Probe tunes the probe (count and per-probe timeout, capped at 2s).
+	Probe ProbeOptions
 }
 
 // Section is the outcome of one check.
 type Section struct {
-	Name    string
-	Command string
-	Status  string
-	Notes   []string // human findings (CRC totals, low Rx power, ...)
-	Output  string   // raw device output
-	Error   string
+	Name    string             `json:"name"`
+	Command string             `json:"command"`
+	Status  string             `json:"status"`
+	Notes   []string           `json:"notes,omitempty"`  // human findings (CRC totals, low Rx power, ...)
+	Output  string             `json:"output,omitempty"` // raw device output
+	Error   string             `json:"error,omitempty"`
+	Metrics map[string]float64 `json:"metrics,omitempty"` // numbers behind the notes (latency, PoE usage, ...)
 }
 
 // Report is the result of Run.
@@ -112,6 +121,34 @@ type Report struct {
 	Connected   bool
 	ConnectErr  string
 	Sections    []Section
+
+	// ProbeSection is the local path and reachability probe; nil when it was
+	// skipped. PoESection is the PoE audit; nil on platforms without one.
+	ProbeSection *Section `json:"probe,omitempty"`
+	PoESection   *Section `json:"poe,omitempty"`
+}
+
+// MarshalJSON is the report's JSON form (netlog diagnose --json): the device
+// is reduced to its inventory identity, never credentials or file paths.
+func (r Report) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Hostname   string    `json:"hostname"`
+		Address    string    `json:"address"`
+		Port       int       `json:"port"`
+		Vendor     string    `json:"vendor"`
+		StartedAt  time.Time `json:"started_at"`
+		ConnectMs  int64     `json:"connect_ms"`
+		Connected  bool      `json:"connected"`
+		ConnectErr string    `json:"connect_error,omitempty"`
+		Healthy    bool      `json:"healthy"`
+		Probe      *Section  `json:"probe,omitempty"`
+		Sections   []Section `json:"sections"`
+		PoE        *Section  `json:"poe,omitempty"`
+	}{
+		r.Device.Hostname, r.Device.Address, r.Device.Port, r.VendorKey, r.StartedAt,
+		r.ConnectTime.Milliseconds(), r.Connected, r.ConnectErr, r.Healthy(),
+		r.ProbeSection, append([]Section{}, r.Sections...), r.PoESection,
+	})
 }
 
 // ifaceRe restricts a user-supplied interface name to characters that are
@@ -188,12 +225,33 @@ func Run(ctx context.Context, d *collector.Dialer, dev inventory.Device, o Optio
 		return rep
 	}
 	secs := Commands(key, o.Interface)
+	poeCmd := PoECommand(key)
 
 	// GATE 1 before any session is opened.
 	for _, s := range secs {
 		if err := triage.Check(s.Command); err != nil {
 			rep.ConnectErr = "allowlist gate: " + err.Error()
 			return rep
+		}
+	}
+	if poeCmd != "" {
+		if err := triage.Check(poeCmd); err != nil {
+			rep.ConnectErr = "allowlist gate: " + err.Error()
+			return rep
+		}
+	}
+
+	// The probe runs first, so it reports even when SSH cannot connect. Behind
+	// a jump host a direct probe would measure the wrong path: say so instead.
+	if !o.NoProbe {
+		if d.ViaJump(dev) {
+			rep.ProbeSection = &Section{
+				Name: SecProbe, Command: "local probe (skipped)", Status: StatusUnknown,
+				Notes: []string{"the device is reached through a jump host; a direct probe from this machine would not test the real path"},
+			}
+		} else {
+			ps := RunProbe(ctx, dev.Address, dev.Port, o.Probe)
+			rep.ProbeSection = &ps
 		}
 	}
 
@@ -220,6 +278,15 @@ func Run(ctx context.Context, d *collector.Dialer, dev inventory.Device, o Optio
 		}
 		rep.Sections = append(rep.Sections, execSection(ctx, client, key, s, opts))
 	}
+	if poeCmd != "" {
+		ps := Section{Name: SecPoE, Command: poeCmd}
+		if ctx.Err() != nil {
+			ps.Status, ps.Error = StatusUnknown, ctx.Err().Error()
+		} else {
+			ps = execSection(ctx, client, key, ps, opts)
+		}
+		rep.PoESection = &ps
+	}
 	return rep
 }
 
@@ -239,7 +306,11 @@ func execSection(ctx context.Context, client *ssh.Client, key string, s Section,
 			return s
 		}
 	}
-	analyse(&s)
+	if s.Name == SecPoE {
+		analysePoE(&s)
+	} else {
+		analyse(&s)
+	}
 	return s
 }
 
@@ -344,7 +415,13 @@ func (r Report) Healthy() bool {
 	if !r.Connected {
 		return false
 	}
-	for _, s := range r.Sections {
+	all := append([]Section{}, r.Sections...)
+	for _, extra := range []*Section{r.ProbeSection, r.PoESection} {
+		if extra != nil {
+			all = append(all, *extra)
+		}
+	}
+	for _, s := range all {
 		if s.Status == StatusWarn || s.Status == StatusError {
 			return false
 		}

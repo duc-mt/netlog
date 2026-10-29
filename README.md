@@ -119,13 +119,122 @@ It also reads `inventory.csv` (`--inventory`) to find the devices never polled.
 ```
 
 One read-only pass against a single device (hostname, address or unique hostname
-prefix from `inventory.csv`): SSH connect/auth latency, active alarms, BGP peers,
-OSPF neighbors, CRC/input errors and optical DDM power (Rx/Tx dBm). Each check shows
-`[OK]`, `[WARN]` or `[ERROR]`; `--raw` adds the device output and `--fail` exits 1
-when anything needs attention. Every command passes the same allowlist as auto-triage.
+prefix from `inventory.csv`): a local reachability probe, SSH connect/auth latency,
+active alarms, BGP peers, OSPF neighbors, CRC/input errors, optical DDM power (Rx/Tx
+dBm) and, on campus switches, the PoE budget. Each check shows `[OK]`, `[WARN]` or
+`[ERROR]`; `--raw` adds the device output, `--json` prints the report as JSON and
+`--fail` exits 1 when anything needs attention. Every command sent to the device
+passes the same allowlist as auto-triage.
+
+**Path & Reachability Probe** (first, so it still reports when SSH cannot connect;
+`--no-probe` skips it). It sends no device command, only TCP connects to the
+management port and ICMP echoes, each capped at 2 seconds:
+
+```
+[OK] Path & Reachability Probe  (local probe: tcp connect x3, icmp echo, route/MTU (no device command))
+      - Route: via eth0 (source 10.0.0.5), local MTU 1500
+      - TCP 10.0.0.1:22: 2.1ms / 2.8ms / 3.4ms (3/3 connected)      <- min / avg / max
+      - ICMP echo: 0.9ms / 1.0ms / 1.1ms (3/3 replies)
+      - MTU: a 1500-byte packet (don't fragment) crosses the path
+```
+
+ICMP uses an unprivileged ping socket (no root, no raw sockets) and is implemented
+for Linux; it needs the user's group inside `net.ipv4.ping_group_range`. Where it is
+not available the probe says so and relies on the TCP numbers alone. The MTU line
+sends a don't-fragment echo of exactly the local interface MTU and warns when small
+echoes pass but the full-size one does not. Behind a jump host the probe is skipped
+(a direct probe would measure the wrong path). Hop-by-hop path tracing is not
+implemented: it needs raw sockets.
+
+**PoE** (Cisco `show power inline`, Aruba `show power-over-ethernet`, Huawei
+`display poe power-state`; none is specified for Ruijie, so Ruijie gets no PoE check):
+warns about any port reporting overload or a fault, and when the power budget in use
+exceeds 90%. When no budget can be read from the output the section says the 90% check
+was skipped.
 Auto-triage playbooks also run transceiver DDM and error-counter commands on link
 down, plus a new `OPTICS_ALARM` playbook, for Cisco, Huawei, Junos, Arista, Ruijie,
 Aruba, VyOS and FortiGate (FortiOS read-only `get ...` commands are allowlisted).
+
+## Live syslog intake: `listen`
+
+```
+./run listen [--port 514] [--proto udp,tcp] [--udp-port N] [--tcp-port N] [--bind ADDR]
+             [--accept-unknown] [--drop-unclassified] [--data-dir data]
+```
+
+Receives syslog from the devices themselves instead of waiting for the next polling
+sweep: UDP and/or TCP, RFC 3164 and RFC 5424, TCP both newline-delimited and
+octet-counted (RFC 6587). `--proto` picks the protocols, `--port` their port, and
+`--udp-port` / `--tcp-port` override it for one of them. Ports below 1024 need root
+or `CAP_NET_BIND_SERVICE`; use e.g. `--port 5514` and forward to it otherwise.
+
+Each message is attributed to an inventory device by its source address (messages
+from other addresses are dropped and counted, unless `--accept-unknown`), parsed by
+that vendor's parser (falling back to generic syslog, and as a last resort kept with
+its arrival time), normalised and classified exactly like a polled log, appended to
+the daily JSONL files and fed to the anomaly detector (flaps, login bursts), whose
+derived events are stored too. `--drop-unclassified` keeps high-volume noise such as
+firewall traffic logs out of storage.
+
+It is passive: it never connects to a device and never triages (use `monitor` for
+that), and it takes its own lock (`.netlog-listen.lock`), so it can run beside
+`monitor` or `collect` on the same data directory. A device that is both polled and
+forwarding syslog is stored twice; pick one. Source addresses are as trustworthy as
+UDP: bind to a management interface (`--bind`) and filter the port at the network
+edge. Resource limits: 8 KiB per message (longer is truncated), a bounded queue (UDP
+drops are counted; TCP senders are slowed instead), 256 TCP connections, 10 minute idle
+timeout. `SIGINT`/`SIGTERM` closes the sockets and flushes pending events before it
+exits. Restart to pick up inventory changes.
+
+## Live dashboard: `top`
+
+```
+./run top [--data-dir data] [--refresh 1s]        # or: ./run monitor --tui
+```
+
+A full-screen terminal dashboard over the stored data, drawn with plain ANSI escape
+sequences (no dependencies): a banner with the FAULT / CONFIG / AUTH / SECURITY /
+SYSTEM counters (last 24h), devices monitored and collection health; a scrolling
+event feed with severity badges; unresolved outages and flapping links (a down with no
+recovery since); and every device's status (`OK`, `FAILING`, `STALE`, `SILENT`, ...)
+with its last poll time. Keys: `q` or `Ctrl+C` quit, `c` cycles the category filter,
+`p` pauses and resumes the feed. It reads incrementally (a stat and a small read per
+refresh), takes no lock, and the terminal is always restored, including on a panic.
+It needs an interactive terminal (at least 60x12). `monitor --tui` polls and watches
+in one terminal; its log lines go to `<data-dir>/monitor.log` so they cannot corrupt
+the screen.
+
+## Topology-aware triage and configuration diffs
+
+Two additions to auto-triage, both strictly read-only and both through the same
+three gates (allowlist, cooldown, resource caps):
+
+* **Peer triage.** On `LINK_DOWN` / `LINK_FLAP` the triage session also reads the
+  neighbour table (Cisco `show cdp neighbors detail`, Arista `show lldp neighbors
+  detail`, Aruba `show lldp info remote-device`, Huawei `display lldp
+  neighbor-information verbose`). If the neighbour on the faulted port is in
+  `inventory.csv`, one secondary triage runs on that device for its own port, and
+  the parent incident records `peer_incident_id` / `peer_device`. A peer triage
+  never starts another one, at most 5 are queued or running at once, and the peer's
+  normal 5 minute cooldown applies. Names and ports taken from a neighbour's
+  advertisement are untrusted and validated before they reach a command.
+* **Configuration diff.** A fresh `CONFIG_CHANGE` / `AFTER_HOURS_CHANGE` runs a
+  read-only comparison (Cisco `show archive config differences nvram:startup-config
+  system:running-config`, Junos `show system rollback compare 0 1`, Arista `show
+  diff rollback-patch`, Huawei `display configuration changes system-committed`) and
+  stores the output in the incident's `config_diff`. These incidents are evidence
+  only and do not fire the Telegram alert.
+
+`--no-peer-triage` and `--no-config-diff` (on `collect` and `monitor`) switch these
+off, since both open SSH sessions that earlier versions did not.
+
+**The neighbour-table parsers, the config-diff commands, the PoE parsers and the
+PAN-OS / Cumulus / forwarded-MikroTik parsers were written from the platforms'
+documented formats and command references and have not been checked against live
+devices.** An output that does not look like the documented layout yields no peer, no
+PoE finding or an unclassified line, never a wrong one; a command a release words
+differently is rejected by the device and shown in the incident. Please check them on
+one device of each platform before relying on them.
 
 ## Configuration
 
@@ -154,8 +263,9 @@ Use a dedicated **read-only** account: netlog never needs more.
 | `huawei_vrp` | `display logbuffer` | CMDRECORD gives "who ran what" |
 | `juniper_junos` | `show log messages \| last 100` | |
 | `fortigate` | `execute log filter category 1` + `execute log display` | interactive session |
-| `aruba`, `ruijie`, `arista`, `paloalto`, `generic` | `show logging` (PAN-OS: `show log system`) | best-effort parser |
-| `mikrotik` | `/log print` | best-effort parser |
+| `aruba`, `ruijie`, `arista`, `paloalto`, `generic` | `show logging` (PAN-OS: `show log system`) | best-effort parser; PAN-OS also parses forwarded `TRAFFIC` / `THREAT` / `SYSTEM` / `CONFIG` CSV syslog |
+| `mikrotik` | `/log print` | best-effort parser; also forwarded syslog (`system`, `firewall`, `interface` topics) |
+| `cumulus` | `tail -n 300 /var/log/syslog` | Cumulus Linux; the login needs read access to the log; FRR, switchd, mstpd and clagd lines |
 | `pfsense` | `tail -q -n 300 /var/log/system.log /var/log/auth.log` | pfSense 2.5 or newer (plain-text logs); the login needs shell access |
 | `checkpoint_gaia` | `tail -n 300 /var/log/messages` | the login's shell must be `/bin/bash` (not `clish`) |
 

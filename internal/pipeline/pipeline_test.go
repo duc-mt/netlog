@@ -432,19 +432,8 @@ func TestSimpleSignalsAndStaleSuppression(t *testing.T) {
 	if s := f.d.Observe(ev("R1", EventOSPFAdjDown, "FAULT", "x", f.now.Add(-24*time.Hour))); len(s) != 0 {
 		t.Fatalf("stale entry produced a signal: %+v", s)
 	}
-	if s := f.d.Observe(ev("R1", EventConfigChange, "CONFIG", "commit", f.now.Add(-24*time.Hour))); len(s) != 0 {
-		t.Fatalf("stale config entry produced a signal: %+v", s)
-	}
-	// Fresh config change triggers config diff playbook.
-	if s := f.d.Observe(ev("R1", EventConfigChange, "CONFIG", "commit", recent)); len(s) != 1 || s[0].Playbook != PlaybookConfigDiff || s[0].Priority != PriorityLow {
-		t.Errorf("fresh config change signal: %+v", s)
-	}
-	// Fresh after-hours change triggers config diff playbook with medium priority.
-	if s := f.d.Observe(ev("R1", EventAfterHoursChange, "CONFIG", "commit", recent)); len(s) != 1 || s[0].Playbook != PlaybookConfigDiff || s[0].Priority != PriorityMedium {
-		t.Errorf("fresh after-hours change signal: %+v", s)
-	}
-	// Unclassified / auth success / cli command produce nothing.
-	for _, e := range []string{EventUnknown, EventLoginSuccess, EventCLICommand} {
+	// Unclassified / auth success / config produce nothing.
+	for _, e := range []string{EventUnknown, EventLoginSuccess, EventConfigChange, EventCLICommand} {
 		if s := f.d.Observe(ev("R1", e, "X", "x", recent)); len(s) != 0 {
 			t.Errorf("%s must not signal", e)
 		}
@@ -961,6 +950,87 @@ func TestClassifierOpticsAndVendorRouting(t *testing.T) {
 		c.Classify(&e)
 		if e.Event != tc.event {
 			t.Errorf("%q: event %s, want %s", tc.raw, e.Event, tc.event)
+		}
+	}
+}
+
+// ---- PAN-OS and MikroTik classification -----------------------------------------------
+
+func TestClassifyPaloAltoAndMikroTik(t *testing.T) {
+	c := NewClassifier(time.UTC)
+	ts := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC) // outside the after-hours window
+	tests := []struct {
+		name, raw, category, event string
+	}{
+		{"pan config", `1,2026/10/20 09:30:59,001234567890,CONFIG,0,0,2026/10/20 09:30:59,10.1.1.5,vsys1,set,tanvt,Web,Succeeded, /config/shared,,,1,0x0`, "CONFIG", EventConfigChange},
+		{"pan threat", `1,2026/10/20 09:32:59,001234567890,THREAT,vulnerability,2305,2026/10/20 09:32:59,203.0.113.9,10.0.0.5,SSH User Authentication Brute-force login Attempt(40015),high`, "SECURITY", EventThreatDetected},
+		{"pan system login failure", `1,2026/10/20 09:30:14,001234567890,SYSTEM,general,0,2026/10/20 09:30:14,vsys1,general,,0,0,general,high,Login failed for user admin`, "AUTH", EventLoginFailure},
+		{"pan traffic stays unclassified", `1,2026/10/20 09:31:58,001234567890,TRAFFIC,end,2305,2026/10/20 09:31:58,10.0.0.5,8.8.8.8,allow-dns,dns,allow`, "SYSTEM", EventUnknown},
+		{"mikrotik change", "Oct 20 09:31:02 edge-rtr2 system,info ip address added by tanvt", "CONFIG", EventConfigChange},
+		{"mikrotik log print change", "09:31:02 system,info filter rule changed by tanvt", "CONFIG", EventConfigChange},
+		{"mikrotik login is not a change", "Oct 20 09:31:01 edge-rtr2 system,info,account user admin logged in from 10.1.1.1 via ssh", "AUTH", EventLoginSuccess},
+		{"mikrotik link", "Oct 20 09:31:00 edge-rtr2 interface,info ether1 link down", "FAULT", EventLinkDown},
+		{"cumulus bgp", "2026-10-20T09:31:03+07:00 leaf01 bgpd[987]: %ADJCHANGE: neighbor 10.0.0.2(swp1) in vrf default Down Peer closed the session", "FAULT", EventBGPPeerDown},
+		{"cumulus link", "Oct 20 09:31:02 leaf01 switchd[1234]: swp1: link down", "FAULT", EventLinkDown},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			e := collector.LogEntry{Raw: tc.raw, Timestamp: ts}
+			c.Classify(&e)
+			if e.Category != tc.category || e.Event != tc.event {
+				t.Errorf("got %s/%s, want %s/%s", e.Category, e.Event, tc.category, tc.event)
+			}
+		})
+	}
+}
+
+// ---- config-change signals (opt-in) ------------------------------------------------------
+
+func TestConfigSignalsAreOptIn(t *testing.T) {
+	now := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
+	recent := now.Add(-time.Minute)
+	mk := func(on bool) *Detector {
+		return NewDetector(DetectorConfig{ConfigSignals: on, Now: func() time.Time { return now }})
+	}
+
+	// Default: configuration changes only feed fault correlation.
+	if s := mk(false).Observe(ev("R1", EventConfigChange, "CONFIG", "x", recent)); len(s) != 0 {
+		t.Fatalf("default detector signalled a config change: %+v", s)
+	}
+
+	for _, event := range []string{EventConfigChange, EventAfterHoursChange} {
+		d := mk(true)
+		s := d.Observe(ev("R1", event, "CONFIG", "x", recent))
+		if len(s) != 1 || s[0].Playbook != PlaybookConfigChange || s[0].Priority != PriorityLow || s[0].Derived {
+			t.Fatalf("%s: %+v", event, s)
+		}
+	}
+
+	// Stale history (first-poll backfill) and detector priming never signal.
+	if s := mk(true).Observe(ev("R1", EventConfigChange, "CONFIG", "x", now.Add(-24*time.Hour))); len(s) != 0 {
+		t.Errorf("stale config change signalled: %+v", s)
+	}
+	d := mk(true)
+	d.Prime([]collector.LogEntry{ev("R1", EventConfigChange, "CONFIG", "x", recent)})
+
+	// The fault correlation still works with signalling on.
+	d = mk(true)
+	d.Observe(ev("R1", EventConfigChange, "CONFIG", "x", recent))
+	s := d.Observe(ev("R1", EventLinkDown, "FAULT", "%LINK-3-UPDOWN: Interface Gi0/1, changed state to down", recent.Add(30*time.Second)))
+	if len(s) != 1 || len(s[0].Annotations) != 1 || !strings.Contains(s[0].Annotations[0], "preceded this fault") {
+		t.Errorf("correlation lost: %+v", s)
+	}
+}
+
+func TestExtractInterfaceCumulus(t *testing.T) {
+	for raw, want := range map[string]string{
+		"switchd[1234]: swp1: link down":                             "swp1",
+		"zebra[88]: Interface swp3 is down":                          "swp3",
+		"bgpd[987]: %ADJCHANGE: neighbor 10.0.0.2(swp12) in vrf red": "swp12",
+		"ospfd[55]: %ADJCHG: Nbr 10.0.0.3 on swp2s1:10.0.0.4":        "swp2s1",
+	} {
+		if got := ExtractInterface(raw); got != want {
+			t.Errorf("ExtractInterface(%q) = %q, want %q", raw, got, want)
 		}
 	}
 }

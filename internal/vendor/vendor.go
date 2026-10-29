@@ -38,6 +38,7 @@ var keys = []string{
 	"vyos",
 	"arista",
 	"mikrotik",
+	"cumulus",
 	"paloalto",
 	"sophos",
 	"generic",
@@ -120,6 +121,12 @@ var aliases = map[string]string{
 	"mikrotik": "mikrotik",
 	"routeros": "mikrotik",
 	"ros":      "mikrotik",
+
+	// NVIDIA / Cumulus Linux
+	"cumulus":        "cumulus",
+	"cumulus_linux":  "cumulus",
+	"nvidia_cumulus": "cumulus",
+	"nvue":           "cumulus",
 
 	// Aruba
 	"aruba":    "aruba",
